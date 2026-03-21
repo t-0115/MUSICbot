@@ -11,6 +11,8 @@ except Exception as e:
     print(f"⚠️ アップデートに失敗しましたが、起動を続行します: {e}")
 # ----------------------------
 
+#git同期確認
+
 import discord
 import os
 import asyncio
