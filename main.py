@@ -1,3 +1,8 @@
+import discord
+import os
+from keep_alive import keep_alive  # 【追加】先ほど作ったファイルを読み込む
+
+
 import subprocess
 import sys
 
@@ -56,3 +61,9 @@ async def on_ready():
     print(f'ログインしました: {bot.user}')
 
 bot.run(TOKEN)
+
+# botを起動するコード（一番下にあるはずです）の直前に、以下の1行を追加します
+keep_alive()  # 【追加】ダミーのWebサーバーを動かし始める
+
+# トークンは.env（環境変数）から読み込む形になっているか確認してください
+bot.run(os.environ['DISCORD_TOKEN'])
