@@ -1,4 +1,5 @@
 import discord
+from .sheet_manager import append_to_sheet, delete_worksheet, create_new_worksheet_in_master
 
 class ChannelNamingModal(discord.ui.Modal):
     def __init__(self, role_name, count):
@@ -21,6 +22,8 @@ class ChannelNamingModal(discord.ui.Modal):
         await interaction.response.send_message("チャンネルとロールを作成中...", ephemeral=True)
         
         try:
+            # 1. スプレッドシートのタブを作成 (時間のかかる処理)
+            create_new_worksheet_in_master(self.role_name)
             new_role = await interaction.guild.create_role(name=self.role_name)
             overwrites = {
                 interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -58,11 +61,34 @@ class JoinModal(discord.ui.Modal, title='参加者情報の入力'):
         if not self.term_input.value.isdigit():
             await interaction.response.send_message("❌ 期は数字で入力してください。", ephemeral=True)
             return
+            
         term = self.term_input.value.zfill(2)
-        self.view.participants[interaction.user.id] = {"name": self.name_input.value, "term": term}
+        user_name = self.name_input.value
+        discord_tag = str(interaction.user)
+        discord_id = interaction.user.id
+        
+        # まずはDiscord上の処理（リスト追加、ロール付与、メッセージ更新）を終わらせる
+        self.view.participants[discord_id] = {"name": user_name, "term": term}
         await interaction.user.add_roles(self.view.role)
         await self.view.update_message(interaction)
-        await interaction.response.send_message(f"【{term}期】{self.name_input.value}として参加登録しました！", ephemeral=True)
+        
+        # ユーザーには「登録完了」を先に伝えて安心させる
+        await interaction.response.send_message(f"【{term}期】{user_name}として参加登録しました！", ephemeral=True)
+
+        # その裏で、別ファイルに分けたスプレッドシート書き込みを実行する
+        try:
+            append_to_sheet(
+                role_name=self.view.role_name,
+                term=term,
+                user_name=user_name,
+                discord_tag=discord_tag,
+                discord_id=discord_id
+            )
+        except Exception as e:
+            # 万が一スプシがエラーになっても、Discordの参加処理は完了している状態になります
+            print(f"Spreadsheet Error: {e}")
+            await interaction.followup.send("⚠️ （システム通知）スプレッドシートへの記録に失敗しました。管理者に連絡してください。", ephemeral=True)
+
 
 class DeleteConfirmModal(discord.ui.Modal, title='⚠️ 削除の最終確認'):
     dummy = discord.ui.TextInput(label='そのまま送信で削除', required=False)
@@ -73,12 +99,21 @@ class DeleteConfirmModal(discord.ui.Modal, title='⚠️ 削除の最終確認')
         self.channels = channels
         self.original_message = original_message
 
+    # cogs/recruit_ui.py 内の DeleteConfirmModal.on_submit メソッドの中
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.send_message("削除中...", ephemeral=True)
+    
+        # ロール名を取得（削除する前に名前を控えておく）
+        role_name = self.role.name
+    
+        # Discord側の削除
         for ch in self.channels:
             await ch.delete()
         if self.role: await self.role.delete()
         if self.original_message: await self.original_message.delete()
+    
+        # スプレッドシートの削除実行
+        delete_worksheet(role_name)
 
 class RecruitView(discord.ui.View):
     def __init__(self, role: discord.Role, channels: list[discord.TextChannel], role_name: str):
