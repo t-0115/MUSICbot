@@ -1,56 +1,101 @@
 import gspread
 import datetime
 from google.oauth2.service_account import Credentials
+import urllib.request
+import json
+import re
 
-# ▼コピーしたあなたのスプレッドシートIDをここに貼り付けます
-MASTER_SHEET_ID = "1CtR3snvb7zcWQYfYj1pXQv-05bTVZmEXgTpMOkP9rhM"
+# ==========================================
+# 設定部分
+# ==========================================
+GAS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbwWqlovqrr5AkSfVAD8CVXU1tzDEAfoYhhCjvbghRrh9lURU40P6oQyqmC-qi8LNz_X/exec"
+FOLDER_URL = "https://drive.google.com/drive/folders/1GrLUGXNaJnEu5yok3FEh1vddXrK-JQGh?usp=drive_link"
+BOT_EMAIL = "musicabot@musicabot-492718.iam.gserviceaccount.com"
 
-def get_sheet(role_name):
-    """指定されたロール名（タブ名）のシートを取得する"""
+# ==========================================
+# 共通関数
+# ==========================================
+def get_gspread_client():
     scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
     credentials = Credentials.from_service_account_file('credentials.json', scopes=scopes)
-    gc = gspread.authorize(credentials)
-    
-    sh = gc.open_by_key(MASTER_SHEET_ID)
-    return sh.worksheet(role_name)
+    return gspread.authorize(credentials)
 
-def create_new_worksheet_in_master(role_name):
-    """マスター用スプレッドシートの中に、新しいタブ（シート）を作成する"""
-    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-    credentials = Credentials.from_service_account_file('credentials.json', scopes=scopes)
-    gc = gspread.authorize(credentials)
+
+# ==========================================
+# スプレッドシート操作のメインロジック
+# ==========================================
+def create_sheet_via_gas(role_name: str) -> str | None:
+    """GASを経由して新しいスプレッドシートを作成する"""
+    match = re.search(r'folders/([a-zA-Z0-9-_]+)', FOLDER_URL)
+    folder_id = match.group(1) if match else ""
+
+    payload = {
+        "action": "create",  # ★ 追加: 作成アクションであることをGASに伝える
+        "roleName": role_name,
+        "folderId": folder_id,
+        "botEmail": BOT_EMAIL
+    }
     
+    data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(GAS_WEBAPP_URL, data=data, method='POST')
+    req.add_header('Content-Type', 'application/json')
+
     try:
-        sh = gc.open_by_key(MASTER_SHEET_ID)
-        # ロール名と同じ名前の新しいタブを作成
-        worksheet = sh.add_worksheet(title=role_name, rows=1000, cols=10)
-        
-        # 1行目にヘッダーを書き込む
-        headers = ["日時", "募集名", "期", "氏名", "Discordユーザー名", "Discord ID"]
-        worksheet.append_row(headers)
-        return True
+        with urllib.request.urlopen(req) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            if result.get("status") == "success":
+                url = result.get('url')
+                print(f"GASでのスプレッドシート作成成功: {url}")
+                return url
+            else:
+                print(f"GAS側でエラーが発生しました: {result.get('message')}")
+                return None
     except Exception as e:
-        # 既に同じ名前のタブがある場合などはここに来ます
-        print(f"タブ作成エラー: {e}")
-        return False
+        print(f"GASへの通信エラー: {e}")
+        return None
 
-def append_to_sheet(role_name, term, user_name, discord_tag, discord_id):
-    """データを1行追加する処理"""
-    sheet = get_sheet(role_name) # 該当するタブを取得
-    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    
-    row = [now, role_name, term, user_name, discord_tag, str(discord_id)]
-    sheet.append_row(row)
-
-def delete_worksheet(role_name):
-    """募集が削除されたとき、該当するタブを削除する"""
-    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-    credentials = Credentials.from_service_account_file('credentials.json', scopes=scopes)
-    gc = gspread.authorize(credentials)
-    
+def append_to_sheet(role_name: str, term: str, user_name: str, discord_tag: str, discord_id: int):
+    """作成済みのスプレッドシートを開き、参加者情報を1行追加する"""
+    gc = get_gspread_client()
     try:
-        sh = gc.open_by_key(MASTER_SHEET_ID)
-        worksheet = sh.worksheet(role_name)
-        sh.del_worksheet(worksheet)
+        sheet = gc.open(role_name).sheet1
+        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        row = [now, role_name, term, user_name, discord_tag, str(discord_id)]
+        sheet.append_row(row)
     except Exception as e:
-        print(f"タブ削除エラー: {e}")
+        print(f"スプレッドシート行追加エラー: {e}")
+        raise e
+
+def remove_from_sheet(role_name: str, discord_id: int):
+    """Discord IDを元に、スプレッドシートから該当ユーザーの行を削除する"""
+    gc = get_gspread_client()
+    try:
+        sheet = gc.open(role_name).sheet1
+        cell = sheet.find(str(discord_id), in_column=6)
+        if cell:
+            sheet.delete_rows(cell.row)
+    except gspread.exceptions.CellNotFound:
+        pass
+    except Exception as e:
+        print(f"スプレッドシート行削除エラー: {e}")
+
+def delete_spreadsheet(role_name: str):
+    """★ 修正: 削除処理もGASに依頼する"""
+    payload = {
+        "action": "delete", # 削除アクション
+        "roleName": role_name
+    }
+    
+    data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(GAS_WEBAPP_URL, data=data, method='POST')
+    req.add_header('Content-Type', 'application/json')
+
+    try:
+        with urllib.request.urlopen(req) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            if result.get("status") == "success":
+                print(f"GAS経由でスプレッドシートを削除しました: {role_name}")
+            else:
+                print(f"GAS側で削除エラーが発生しました: {result.get('message')}")
+    except Exception as e:
+        print(f"GASへの通信エラー(削除): {e}")
