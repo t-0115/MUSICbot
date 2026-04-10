@@ -20,13 +20,14 @@ class MyBot(commands.Bot):
         await self.load_extension("cogs.greetings")
         await self.load_extension("cogs.recruit")
         
-        # 【注意】スラッシュコマンドの同期
-        # 頻繁な実行による429エラー（制限）を防ぐため、コマンドを追加・変更した時だけ # を外して実行します
-        await self.tree.sync()
-
-    async def on_ready(self):
-        # ログイン完了時のメッセージ
-        print(f'ログインしました: {self.user}')
+        # 環境変数 'RENDER' の有無でローカルか本番かを判定
+        if not os.getenv('RENDER'):
+            # ローカル環境（PC）の場合のみ実行される
+            print("💻 ローカル環境を検知しました。スラッシュコマンドを同期します...")
+            await self.tree.sync()
+        else:
+            # Render環境の場合
+            print("☁️ Render環境を検知しました。スラッシュコマンドの同期をスキップします。")
 
 
 # ここから下がプログラムの「本当のスタート地点」です
