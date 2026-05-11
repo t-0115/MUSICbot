@@ -55,13 +55,31 @@ def create_sheet_via_gas(role_name: str) -> str | None:
         return None
 
 def append_to_sheet(role_name: str, term: str, user_name: str, discord_tag: str, discord_id: int):
-    """作成済みのスプレッドシートを開き、参加者情報を1行追加する"""
+    """作成されたスプレッドシートを開いてデータを1行追加する（重複チェック付き）"""
     gc = get_gspread_client()
+    
     try:
         sheet = gc.open(role_name).sheet1
+        
+        # ==========================================
+        # ★ 追加: スプレッドシート側の重複チェック
+        # ==========================================
+        try:
+            # 6列目（Discord ID）の中に、既に同じIDが存在するか検索
+            existing_cell = sheet.find(str(discord_id), in_column=6)
+            if existing_cell:
+                print(f"重複を検知しました。ID: {discord_id} の追加をスキップします。")
+                return  # 既に存在する場合は、ここで処理を強制終了して書き込まない
+        except gspread.exceptions.CellNotFound:
+            # 見つからなかった場合（新規ユーザー）はエラーになるので、passして下へ進む
+            pass
+        # ==========================================
+
+        # 重複がなければ、今まで通り書き込む
         now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         row = [now, role_name, term, user_name, discord_tag, str(discord_id)]
         sheet.append_row(row)
+        
     except Exception as e:
         print(f"スプレッドシート行追加エラー: {e}")
         raise e
