@@ -133,7 +133,6 @@ class DeleteConfirmModal(discord.ui.Modal, title='⚠️ 削除の最終確認')
         # スプレッドシートの削除
         delete_spreadsheet(role_name)
 
-
 # ==========================================
 # Views (ボタンUI関連)
 # ==========================================
@@ -169,7 +168,7 @@ class RecruitView(discord.ui.View):
         
         desc = f"専用チャンネル: {mentions}\n"
         if self.sheet_url:
-            desc += f"📄 **[名簿スプレッドシートを開く]({self.sheet_url})**\n\n"
+            desc += f"📄 **[参加者一覧]({self.sheet_url})**\n\n"
         desc += "下のボタンで参加してください。"
         embed.description = desc
         
@@ -183,6 +182,9 @@ class RecruitView(discord.ui.View):
     @discord.ui.button(label="参加", style=discord.ButtonStyle.success, custom_id="recruit_join")
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
         """参加ボタンの処理"""
+        if interaction.user.id in self.participants:
+            await interaction.response.send_message("❌ 既に登録されています！", ephemeral=True)
+            return
         await interaction.response.send_modal(JoinModal(self))
 
     @discord.ui.button(label="参加取り消し", style=discord.ButtonStyle.primary, custom_id="recruit_cancel")
