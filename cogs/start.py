@@ -1,14 +1,14 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-from .recruit_ui import ChannelNamingModal, RecruitView 
+from .start_ui import ChannelNamingModal, StartView 
 from .sheet_manager import create_sheet_via_gas
 
-class RecruitCog(commands.Cog):
+class StartCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="recruit", description="募集システムを開始します")
+    @app_commands.command(name="start", description="イベントを開始します")
     @app_commands.describe(
         role_name="作成するロールの名前",
         channel_count="作成するチャンネル数 (0~5)"
@@ -28,7 +28,7 @@ class RecruitCog(commands.Cog):
                 sheet_url = create_sheet_via_gas(role_name)
                 
                 # 3. UI（埋め込みとボタン）の生成と送信
-                view = RecruitView(role=new_role, channels=[], role_name=role_name, sheet_url=sheet_url)
+                view = StartView(role=new_role, channels=[], role_name=role_name, sheet_url=sheet_url)
                 await interaction.followup.send(embed=view.create_embed(), view=view)
                 
             except discord.Forbidden:
@@ -42,4 +42,4 @@ class RecruitCog(commands.Cog):
             await interaction.response.send_modal(modal)
 
 async def setup(bot):
-    await bot.add_cog(RecruitCog(bot))
+    await bot.add_cog(StartCog(bot))
