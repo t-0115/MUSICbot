@@ -56,7 +56,7 @@ class ChannelNamingModal(discord.ui.Modal):
                 created_channels.append(ch)
 
             # 5. 募集用の埋め込みメッセージとボタンを送信
-            view = RecruitView(role=new_role, channels=created_channels, role_name=self.role_name, sheet_url=sheet_url)
+            view = StartView(role=new_role, channels=created_channels, role_name=self.role_name, sheet_url=sheet_url)
             await interaction.channel.send(embed=view.create_embed(), view=view)
             
         except Exception as e:
@@ -137,7 +137,7 @@ class DeleteConfirmModal(discord.ui.Modal, title='⚠️ 削除の最終確認')
 # Views (ボタンUI関連)
 # ==========================================
 
-class RecruitView(discord.ui.View):
+class StartView(discord.ui.View):
     """募集メッセージに付随するボタンとロジックを管理するView"""
     def __init__(self, role: discord.Role, channels: list[discord.TextChannel], role_name: str, sheet_url: str = ""):
         super().__init__(timeout=None) # timeout=Noneで一定時間経過後もボタンを機能させる
