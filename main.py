@@ -20,7 +20,8 @@ class MyBot(commands.Bot):
         await self.load_extension("cogs.greetings")
         await self.load_extension("cogs.start")
         await self.load_extension("cogs.song_recruit")
-        
+        await self.load_extension("cogs.song_recruit_slash")
+
         # 環境変数 'RENDER' の有無でローカルか本番かを判定
         if not os.getenv('RENDER'):
             # ローカル環境（PC）の場合のみ実行される
