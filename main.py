@@ -19,6 +19,7 @@ class MyBot(commands.Bot):
         # Cog（機能ごとの別ファイル）を読み込む
         await self.load_extension("cogs.greetings")
         await self.load_extension("cogs.start")
+        await self.load_extension("cogs.song_recruit")
         
         # 環境変数 'RENDER' の有無でローカルか本番かを判定
         if not os.getenv('RENDER'):
