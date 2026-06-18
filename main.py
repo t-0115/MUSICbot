@@ -22,6 +22,8 @@ class MyBot(commands.Bot):
         await self.load_extension("cogs.song_recruit")
         await self.load_extension("cogs.song_recruit_slash")
         await self.load_extension("cogs.entry_sheet")
+        await self.load_extension("cogs.role_manager")
+        await self.load_extension("cogs.channel_manager")
 
         # 環境変数 'RENDER' の有無でローカルか本番かを判定
         if not os.getenv('RENDER'):
