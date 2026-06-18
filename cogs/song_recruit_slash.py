@@ -44,7 +44,7 @@ def normalize_capacity(capacity_raw: str) -> int | None:
     return None
 
 def parse_players(text: str) -> str:
-    players_raw = extract_first_group(r'【演奏者】(.*?)(\n【|$)', text, default='', flags=re.DOTALL)
+    players_raw = extract_first_group(r'【演奏者】(.*?)(\n【|$|\n\n🔗)', text, default='', flags=re.DOTALL)
     lines = [format_player_line(line)
              for line in players_raw.splitlines()
              if re.search(r'\d+期', line)]
@@ -55,9 +55,9 @@ def parse_players(text: str) -> str:
 # 定員到達時のDM用View ＆ 追加募集Modal
 # ==========================================
 class AddCapacityModal(discord.ui.Modal):
-    def __init__(self, board_message: discord.Message, board_view: 'SongBoardView', dm_view: 'CapacityReachedView'):
+    def __init__(self, trigger_message: discord.Message, board_view: 'SongBoardView', dm_view: 'CapacityReachedView'):
         super().__init__(title='追加募集人数の設定')
-        self.board_message = board_message
+        self.trigger_message = trigger_message
         self.board_view = board_view
         self.dm_view = dm_view
 
@@ -77,8 +77,8 @@ class AddCapacityModal(discord.ui.Modal):
         added = int(self.added_capacity.value)
         self.board_view.capacity += added
         
-        await self.board_view.update_board_display(self.board_message)
-        await self.board_view.update_source_message(interaction.guild)
+        await self.board_view.update_board_display(self.trigger_message)
+        await self.board_view.update_source_message(self.trigger_message)
 
         for child in self.dm_view.children:
             child.disabled = True
@@ -88,9 +88,9 @@ class AddCapacityModal(discord.ui.Modal):
         await interaction.response.send_message('✅ 募集人数を増やし、募集を継続しました！', ephemeral=True)
 
 class CapacityReachedView(discord.ui.View):
-    def __init__(self, board_message: discord.Message, board_view: 'SongBoardView'):
+    def __init__(self, trigger_message: discord.Message, board_view: 'SongBoardView'):
         super().__init__(timeout=None)
-        self.board_message = board_message
+        self.trigger_message = trigger_message
         self.board_view = board_view
 
     @discord.ui.button(label='募集を締め切る', style=discord.ButtonStyle.danger)
@@ -98,11 +98,11 @@ class CapacityReachedView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(view=self)
-        await self.board_view.execute_close(interaction, self.board_message)
+        await self.board_view.execute_close(interaction, self.trigger_message)
 
     @discord.ui.button(label='追加で募集する', style=discord.ButtonStyle.primary)
     async def add_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(AddCapacityModal(self.board_message, self.board_view, self))
+        await interaction.response.send_modal(AddCapacityModal(self.trigger_message, self.board_view, self))
 
 
 # ==========================================
@@ -112,7 +112,7 @@ class JoinSongModal(discord.ui.Modal):
     def __init__(self, view: 'SongBoardView'):
         super().__init__(title='エントリー情報の入力')
         self.view = view
-        self.generation = discord.ui.TextInput(label='期', placeholder='例: 10期', max_length=10, required=True)
+        self.generation = discord.ui.TextInput(label='期（半角数字のみ）', placeholder='例: 10', max_length=5, required=True)
         self.name = discord.ui.TextInput(label='氏名', placeholder='例: 山田太郎', max_length=20, required=True)
         self.faculty = discord.ui.TextInput(label='学部・学科・学年', placeholder='例: 工学部情報学科2年', max_length=30, required=True)
         self.user_message = discord.ui.TextInput(label='メッセージ (任意)', style=discord.TextStyle.paragraph, required=False, max_length=200)
@@ -123,18 +123,24 @@ class JoinSongModal(discord.ui.Modal):
         self.add_item(self.user_message)
 
     async def on_submit(self, interaction: discord.Interaction):
+        gen_input = self.generation.value.replace('期', '').strip()
+        
+        if not gen_input.isascii() or not gen_input.isdigit():
+            await interaction.response.send_message('❌ 「期」は半角数字で入力してください。（例: 10）', ephemeral=True)
+            return
+
         if interaction.user.id in self.view.joined_users:
             await interaction.response.send_message('❌ 登録済みです。', ephemeral=True)
             return
 
         self.view.joined_users.add(interaction.user.id)
-        player_info = format_player_line(f'{self.generation.value} {self.name.value}({self.faculty.value})')
+        player_info = format_player_line(f'{gen_input}期 {self.name.value}({self.faculty.value})')
         
         self.view.button_joined_players.append(player_info)
         
-        await self.view.add_player_info_to_embed(interaction.message, player_info)
-        await self.view.update_source_message(interaction.guild)
+        # 掲示板Embedと元メッセージの両方を更新（どちらのボタンから押されても対応可能）
         await self.view.update_board_display(interaction.message, interaction)
+        await self.view.update_source_message(interaction.message, interaction)
 
         if self.view.is_full():
             dm_embed = discord.Embed(
@@ -157,8 +163,6 @@ class SongBoardView(discord.ui.View):
         self.capacity = capacity
         self.song_title = song_title
         self.initial_players = initial_players
-        self.source_channel_id = 0
-        self.source_message_id = 0
         self.joined_users: set[int] = set()
         self.button_joined_players: list[str] = []
 
@@ -173,24 +177,47 @@ class SongBoardView(discord.ui.View):
             all_players.append('\n'.join(self.button_joined_players))
         return '\n'.join(all_players) if all_players else 'なし'
 
-    async def update_source_message(self, guild: discord.Guild | None) -> None:
-        """Botが投稿した大元のメッセージを正規表現で書き換える"""
-        if not guild:
+    async def get_both_messages(self, target_message: discord.Message) -> tuple[discord.Message | None, discord.Message | None]:
+        """引数のメッセージが元テキストか掲示板かを自動判定し、URLを辿って両方のメッセージオブジェクトを取得する"""
+        source_msg = None
+        board_msg = None
+
+        if target_message.embeds and ('🎵' in target_message.embeds[0].title or '🔒' in target_message.embeds[0].title):
+            board_msg = target_message
+            match = re.search(r'https://discord\.com/channels/\d+/(\d+)/(\d+)', board_msg.embeds[0].description or '')
+            if match:
+                ch = target_message.guild.get_channel(int(match.group(1)))
+                if ch:
+                    try:
+                        source_msg = await ch.fetch_message(int(match.group(2)))
+                    except discord.NotFound:
+                        pass
+        else:
+            source_msg = target_message
+            match = re.search(r'https://discord\.com/channels/\d+/(\d+)/(\d+)', source_msg.content)
+            if match:
+                ch = target_message.guild.get_channel(int(match.group(1)))
+                if ch:
+                    try:
+                        board_msg = await ch.fetch_message(int(match.group(2)))
+                    except discord.NotFound:
+                        pass
+
+        return source_msg, board_msg
+
+    async def update_source_message(self, message: discord.Message, interaction: discord.Interaction = None) -> None:
+        """元のテキストメッセージを更新する（ボタンの再添付も行う）"""
+        source_msg, board_msg = await self.get_both_messages(message)
+        if not source_msg:
             return
+
         try:
-            channel = guild.get_channel(self.source_channel_id)
-            if not channel:
-                return
-            msg = await channel.fetch_message(self.source_message_id)
-            
             remaining = max(0, self.capacity - len(self.joined_users))
+            base_content = source_msg.content.replace('~~', '')
 
-            # 【追加】横線をリセットする（再開時に元に戻すため）
-            base_content = msg.content.replace('~~', '')
-
-            # 1. 募集人数の数字/漢数字部分を置換
-            def replace_num(match: re.Match[str]) -> str:
-                matched = match.group(1)
+            # 1. 募集人数の更新
+            def replace_num(m: re.Match[str]) -> str:
+                matched = m.group(1)
                 if re.fullmatch(r'\d+', matched):
                     return str(remaining)
                 return int_to_kanji(remaining) if len(matched) == 1 else str(remaining)
@@ -198,58 +225,83 @@ class SongBoardView(discord.ui.View):
             new_content = re.sub(
                 r'((?:\d+|[' + KANJI_NUMBERS + r']))(?=[^\n]*?募集)',
                 replace_num,
-                base_content,  # base_contentを使用するように変更
+                base_content,
                 count=1,
             )
 
-            # 2. 演奏者リストをマージ済みの最新状態に置換
+            # 2. 演奏者リストの更新 (🔗リンクの手前に挿入する)
             merged_players = self.get_merged_players()
             if '【演奏者】' in new_content:
-                new_content = re.sub(r'【演奏者】.*', f'【演奏者】\n{merged_players}', new_content, flags=re.DOTALL)
+                new_content = re.sub(r'【演奏者】(.*?)(?=\n【|$|\n\n🔗)', f'【演奏者】\n{merged_players}', new_content, flags=re.DOTALL)
             else:
-                new_content += f'\n\n【演奏者】\n{merged_players}'
+                if '🔗 [掲示板を見る]' in new_content:
+                    new_content = new_content.replace('🔗 [掲示板を見る]', f'\n【演奏者】\n{merged_players}\n\n🔗 [掲示板を見る]')
+                else:
+                    new_content += f'\n\n【演奏者】\n{merged_players}'
 
-            if new_content != msg.content:
-                await msg.edit(content=new_content)
+            # 3. 締め切り状態であれば全体に横線を引く
+            is_closed = False
+            if board_msg and board_msg.embeds and '🔒' in board_msg.embeds[0].title:
+                is_closed = True
+
+            if is_closed:
+                lines = new_content.split('\n')
+                new_lines = []
+                for line in lines:
+                    if line.strip() and not line.startswith('🔗'):
+                        new_lines.append(f"~~{line}~~")
+                    else:
+                        new_lines.append(line)
+                new_content = '\n'.join(new_lines)
+
+            if interaction and not interaction.response.is_done() and interaction.message.id == source_msg.id:
+                await interaction.response.edit_message(content=new_content, view=self)
+            else:
+                await source_msg.edit(content=new_content, view=self)
         except Exception:
             pass
 
     async def update_board_display(self, message: discord.Message, interaction: discord.Interaction = None):
-        embed = message.embeds[0] if message.embeds else None
-        if embed is None:
+        """掲示板のEmbedメッセージを更新する"""
+        _, board_msg = await self.get_both_messages(message)
+        if not board_msg or not board_msg.embeds:
             return
 
+        embed = board_msg.embeds[0]
         remaining = self.capacity - len(self.joined_users)
+        
+        # ボタンの状態からクローズ状態かを推測する
         join_button = next((child for child in self.children if getattr(child, 'custom_id', None) == 'song_join'), None)
+        is_closed_manually = (join_button and join_button.disabled and remaining > 0)
 
-        def set_field(name: str, value: str):
-            for index, field in enumerate(embed.fields):
-                if field.name == name:
-                    embed.set_field_at(index, name=name, value=value, inline=True)
-                    return
-
-        if remaining <= 0:
-            set_field('募集人数', '⚠️ 定員到達（確認中）')
-            embed.color = discord.Color.orange()
-            if join_button:
-                join_button.disabled = True
-        else:
-            set_field('募集人数', f'あと {remaining} 人')
-            embed.color = discord.Color.green()
-            if join_button:
-                join_button.disabled = False
-
-        if interaction and not interaction.response.is_done():
-            await interaction.response.edit_message(embed=embed, view=self)
-        else:
-            await message.edit(embed=embed, view=self)
-
-    async def add_player_info_to_embed(self, message: discord.Message, player_info: str) -> None:
-        embed = message.embeds[0]
         for index, field in enumerate(embed.fields):
             if field.name == '現在の演奏者':
                 embed.set_field_at(index, name='現在の演奏者', value=self.get_merged_players(), inline=False)
-                break
+            elif field.name == '募集人数':
+                if is_closed_manually:
+                    embed.set_field_at(index, name='募集人数', value='終了', inline=True)
+                elif remaining <= 0:
+                    embed.set_field_at(index, name='募集人数', value='⚠️ 定員到達（確認中）', inline=True)
+                else:
+                    embed.set_field_at(index, name='募集人数', value=f'あと {remaining} 人', inline=True)
+
+        if is_closed_manually:
+            embed.color = discord.Color.red()
+            if '🎵 曲募集:' in embed.title:
+                embed.title = embed.title.replace('🎵 曲募集:', '🔒 [募集終了]')
+        elif remaining <= 0:
+            embed.color = discord.Color.orange()
+        else:
+            embed.color = discord.Color.green()
+            if join_button:
+                join_button.disabled = False
+            if '🔒 [募集終了]' in embed.title:
+                embed.title = embed.title.replace('🔒 [募集終了]', '🎵 曲募集:')
+
+        if interaction and not interaction.response.is_done() and interaction.message.id == board_msg.id:
+            await interaction.response.edit_message(embed=embed, view=self)
+        else:
+            await board_msg.edit(embed=embed, view=self)
 
     async def send_recruiter_dm(self, embed: discord.Embed, view: discord.ui.View | None = None) -> None:
         try:
@@ -277,56 +329,67 @@ class SongBoardView(discord.ui.View):
             await interaction.response.send_message('❌ 募集者のみ操作可能です。', ephemeral=True)
             return
 
-        embed = interaction.message.embeds[0]
-        if '🔒 [募集終了]' in embed.title:
-            embed.title = embed.title.replace('🔒 [募集終了]', '🎵 曲募集:')
-
         for child in self.children:
             child.disabled = False
 
         await self.update_board_display(interaction.message, interaction)
-        # 再開時は元のテキストにも「募集」の文字と人数を復元する必要がありますが、
-        # 今の仕様だと「あと○人」のままで進める挙動になります。
-        await self.update_source_message(interaction.guild)
+        await self.update_source_message(interaction.message, interaction)
 
-    async def execute_close(self, interaction: discord.Interaction, board_message: discord.Message | None = None):
-        target_msg = board_message or interaction.message
-        embed = target_msg.embeds[0]
+    async def execute_close(self, interaction: discord.Interaction, target_message: discord.Message | None = None):
+        msg = target_message or interaction.message
+        source_msg, board_msg = await self.get_both_messages(msg)
 
-        if '🎵 曲募集:' in embed.title:
-            embed.title = embed.title.replace('🎵 曲募集:', '🔒 [募集終了]')
-        embed.color = discord.Color.red()
-
+        # 1. Viewのコンポーネント（ボタン）を無効化
         for child in self.children:
             if getattr(child, 'custom_id', None) in ['song_join', 'song_close']:
                 child.disabled = True
 
-        if board_message is None:
-            await interaction.response.edit_message(embed=embed, view=self)
-        else:
-            await target_msg.edit(embed=embed, view=self)
+        # 2. 掲示板側の更新
+        if board_msg and board_msg.embeds:
+            embed = board_msg.embeds[0]
+            if '🎵 曲募集:' in embed.title:
+                embed.title = embed.title.replace('🎵 曲募集:', '🔒 [募集終了]')
+            embed.color = discord.Color.red()
+            
+            for index, field in enumerate(embed.fields):
+                if field.name == '募集人数':
+                    embed.set_field_at(index, name='募集人数', value='終了', inline=True)
 
-        # 【変更】募集元メッセージを横線(取り消し線)で消す処理
-        try:
-            channel = interaction.guild.get_channel(self.source_channel_id)
-            if channel:
-                msg = await channel.fetch_message(self.source_message_id)
-                # 全ての行に横線(~~)を引く（空行はそのままにする）
-                lines = msg.content.replace('~~', '').split('\n')
-                new_content = '\n'.join([f"~~{line}~~" if line.strip() else "" for line in lines])
-                await msg.edit(content=new_content)
-        except Exception:
-            pass
+            if interaction.message.id == board_msg.id and not interaction.response.is_done():
+                await interaction.response.edit_message(embed=embed, view=self)
+            else:
+                await board_msg.edit(embed=embed, view=self)
 
-        # コピペ用テキストのDM送信
+        # 3. 元テキスト側の更新
+        final_text = f"【曲名】{self.song_title}\n【演奏者】\n{self.get_merged_players()}"
+        if source_msg:
+            clean_content = source_msg.content.replace('~~', '')
+            merged_players = self.get_merged_players()
+            if '【演奏者】' in clean_content:
+                final_text = re.sub(r'【演奏者】(.*?)(?=\n【|$|\n\n🔗)', f'【演奏者】\n{merged_players}', clean_content, flags=re.DOTALL)
+            else:
+                if '🔗 [掲示板を見る]' in clean_content:
+                    final_text = clean_content.replace('🔗 [掲示板を見る]', f'\n【演奏者】\n{merged_players}\n\n🔗 [掲示板を見る]')
+                else:
+                    final_text = clean_content + f'\n\n【演奏者】\n{merged_players}'
+
+            lines = final_text.split('\n')
+            new_lines = [f"~~{line}~~" if line.strip() and not line.startswith('🔗') else line for line in lines]
+            new_content = '\n'.join(new_lines)
+            
+            if interaction.message.id == source_msg.id and not interaction.response.is_done():
+                await interaction.response.edit_message(content=new_content, view=self)
+            else:
+                await source_msg.edit(content=new_content, view=self)
+
+        # 4. DM送信（コピペ用テキストからは🔗リンクを除外する）
+        final_text_no_link = re.sub(r'\n\n🔗.*', '', final_text)
         dm_embed = discord.Embed(
             title='📝 募集締め切り完了',
             description='募集を締め切りました！\n以下のテキストをコピーしてエントリーチャンネルへ投稿してください。',
             color=discord.Color.gold(),
         )
-        
-        final_text = f"【曲名】{self.song_title}\n【演奏者】\n{self.get_merged_players()}"
-        dm_embed.add_field(name='コピー用テキスト', value=f'```text\n{final_text}\n```', inline=False)
+        dm_embed.add_field(name='コピー用テキスト', value=f'```text\n{final_text_no_link}\n```', inline=False)
         await self.send_recruiter_dm(dm_embed)
 
 
@@ -339,18 +402,15 @@ async def post_to_board_slash(interaction: discord.Interaction, raw_text: str, c
         await interaction.followup.send('❌ 「掲示板」という名前のチャンネルが見つかりません。', ephemeral=True)
         return
 
-    # 1. 募集元チャンネルにBotが入力された文章をそのまま投稿（これによりBotが編集権限を持つ）
-    source_msg = await interaction.channel.send(content=raw_text)
-
-    # 2. 掲示板用Viewの作成とEmbedの送信
     view = SongBoardView(
         recruiter=interaction.user,
         capacity=capacity,
         song_title=title,
         initial_players=players,
     )
-    view.source_channel_id = source_msg.channel.id
-    view.source_message_id = source_msg.id
+
+    # まず元テキストをView付きで送信する
+    source_msg = await interaction.channel.send(content=raw_text, view=view)
 
     embed = discord.Embed(
         title=f'🎵 曲募集: {title}',
@@ -365,7 +425,13 @@ async def post_to_board_slash(interaction: discord.Interaction, raw_text: str, c
     embed.add_field(name='曲時間', value=time_str, inline=True)
     embed.add_field(name='現在の演奏者', value=players if players != '不明' else 'なし', inline=False)
 
-    await board_channel.send(embed=embed, view=view)
+    # 掲示板にEmbedを送信する
+    board_msg = await board_channel.send(embed=embed, view=view)
+
+    # 元テキストの下部に掲示板へのリンクを追記して更新する（これで双方向のリンクが完了！）
+    updated_raw_text = raw_text + f"\n\n🔗 [掲示板を見る]({board_msg.jump_url})"
+    await source_msg.edit(content=updated_raw_text, view=view)
+
     await interaction.followup.send(f'✅ {board_channel.mention} に掲示板を作成し、このチャンネルに募集文を投稿しました！', ephemeral=True)
 
 
@@ -417,7 +483,6 @@ class RawTextRecruitModal(discord.ui.Modal):
         capacity = normalize_capacity(capacity_raw)
         
         if capacity is None:
-            # 解析不能な場合は人数入力モーダルへ
             await interaction.response.send_modal(CapacityConfirmModal(text, title, time_str, players))
         else:
             await interaction.response.defer(ephemeral=True)
