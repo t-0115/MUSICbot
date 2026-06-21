@@ -157,7 +157,6 @@ class JoinModal(discord.ui.Modal, title='参加者情報の入力'):
         
         # Discordのメッセージ表示用には結合する
         user_name_combined = f"{last_name} {first_name}"
-        discord_tag = str(interaction.user)
         discord_id = interaction.user.id
         
         # 参加情報を追加（DiscordのEmbed表示用）
@@ -171,13 +170,12 @@ class JoinModal(discord.ui.Modal, title='参加者情報の入力'):
         await interaction.response.send_message(f"【{term}期】{user_name_combined}として参加登録しました！", ephemeral=True)
 
         try:
-            # 【変更点】スプレッドシートへは名字と名前を分けて送信
+            # 【変更点】スプレッドシートへは名字と名前を分けて送信 (discord_tagを削除)
             append_to_sheet(
                 role_name=self.role_name,
                 term=term,
                 last_name=last_name,
                 first_name=first_name,
-                discord_tag=discord_tag,
                 discord_id=discord_id
             )
         except Exception as e:
