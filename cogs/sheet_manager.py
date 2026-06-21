@@ -9,12 +9,15 @@ import re
 # ==========================================
 # 設定部分
 # ==========================================
-GAS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbw9iToFFmGfT2gC44FTXuhqV_AdBDgEeuu0oJnGs6ttvImBqc-Slz_rRfczUpFMKaL_/exec"
-FOLDER_URL = "https://drive.google.com/drive/folders/1GrLUGXNaJnEu5yok3FEh1vddXrK-JQGh?usp=drive_link"
-BOT_EMAIL = "musicabot@musicabot-492718.iam.gserviceaccount.com"
+with open("config.json", "r", encoding="utf-8") as f:
+    config = json.load(f)
+
+GAS_WEBAPP_URL = config["GAS_WEBAPP_URL"]
+FOLDER_URL = config["FOLDER_URL"]
+BOT_EMAIL = config["BOT_EMAIL"]
 
 # ★ 今後項目を増やす時は、ここのリストを変更するだけでOKになります！
-DEFAULT_HEADERS = ["日時", "募集名", "期", "名字", "名前", "Discordユーザー名", "Discord ID"]
+DEFAULT_HEADERS = ["日時", "募集名", "期", "名字", "名前", "Discord ID"]
 
 # ==========================================
 # 共通関数
@@ -67,7 +70,7 @@ def create_sheet_via_gas(role_name: str) -> str | None:
         print(f"GASへの通信エラー: {e}")
         return None
 
-def append_to_sheet(role_name: str, term: str, last_name: str, first_name: str, discord_tag: str, discord_id: int):
+def append_to_sheet(role_name: str, term: str, last_name: str, first_name: str, discord_id: int):
     """作成されたスプレッドシートを開いてデータを1行追加する（重複チェック付き）"""
     gc = get_gspread_client()
     
@@ -86,7 +89,7 @@ def append_to_sheet(role_name: str, term: str, last_name: str, first_name: str, 
         # 重複がなければ書き込む
         now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         # ※ もし DEFAULT_HEADERS の順番を変えたら、ここの row の順番も合わせる
-        row = [now, role_name, term, last_name, first_name, discord_tag, str(discord_id)]
+        row = [now, role_name, term, last_name, first_name, str(discord_id)]
         sheet.append_row(row)
         
     except Exception as e:
@@ -99,7 +102,7 @@ def remove_from_sheet(role_name: str, discord_id: int):
     try:
         sheet = gc.open(role_name).sheet1
         # ★ 「Discord ID」という見出しが何列目にあるか自動で探す
-        id_col = get_column_index(sheet, "Discord ID", fallback_index=7)
+        id_col = get_column_index(sheet, "Discord ID", fallback_index=6)
         cell = sheet.find(str(discord_id), in_column=id_col)
         if cell:
             sheet.delete_rows(cell.row)
