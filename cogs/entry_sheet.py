@@ -41,7 +41,10 @@ def parse_entry_message(text: str, master_names: dict, last_name_map: dict) -> d
         if not clean_input:
             continue
             
-        if clean_input in master_names:
+        # 名簿データが1件もない（新規作成時など）場合は照合をスキップし⚠️を付けない
+        if not master_names and not last_name_map:
+            final_name = f"{fallback_term} {clean_input}".strip()
+        elif clean_input in master_names:
             final_name = master_names[clean_input]
         elif clean_input in last_name_map:
             candidates = last_name_map[clean_input]
@@ -78,39 +81,50 @@ class EntrySheetCog(commands.Cog):
                     target_role_name = target.name
                     break
 
-        if not target_role_name:
-            return None, "❌ このチャンネルの権限設定から、対象となるロール名を特定できませんでした。"
+        # チャンネル名から _ の前の文字を抽出
+        fallback_name = interaction.channel.name.split('_')[0]
 
         try:
             gc = sheet_manager.get_gspread_client()
         except Exception as e:
             return None, f"❌ Google認証エラーが発生しました: {e}"
 
-        used_sheet_name = target_role_name
-        
-        try:
-            spreadsheet = gc.open(target_role_name)
-        except gspread.exceptions.SpreadsheetNotFound:
-            fallback_name = interaction.channel.name.split('_')[0]
+        spreadsheet = None
+        used_sheet_name = fallback_name
+
+        # ① まずロール名で検索を試みる
+        if target_role_name:
+            try:
+                spreadsheet = gc.open(target_role_name)
+                used_sheet_name = target_role_name
+            except gspread.exceptions.SpreadsheetNotFound:
+                pass
+
+        # ② ロール名で見つからない、またはそもそもロール名が取得できなかった場合は、チャンネル名で検索
+        if not spreadsheet:
             try:
                 spreadsheet = gc.open(fallback_name)
                 used_sheet_name = fallback_name
             except gspread.exceptions.SpreadsheetNotFound:
-                if not create_if_missing:
-                    return None, f"⚠️ スプレッドシートが見つかりません。先に `/エントリー集計` を行ってください。"
-                
-                used_sheet_name = target_role_name
-                await interaction.followup.send(f"⏳ スプレッドシート「**{used_sheet_name}**」が見つからないため、指定フォルダに新規作成しています...")
-                
-                url = sheet_manager.create_sheet_via_gas(used_sheet_name)
-                if not url:
-                    return None, "❌ GAS経由でのスプレッドシート作成に失敗しました。"
-                
-                await asyncio.sleep(4)
-                try:
-                    spreadsheet = gc.open(used_sheet_name)
-                except Exception as e:
-                    return None, f"❌ スプレッドシートの作成は成功しましたが、読み込みに失敗しました: {e}"
+                pass
+
+        # ③ どちらでも見つからなかった場合は新規作成
+        if not spreadsheet:
+            if not create_if_missing:
+                return None, f"⚠️ スプレッドシートが見つかりません。先に `/エントリー集計` を行ってください。"
+            
+            used_sheet_name = fallback_name
+            await interaction.followup.send(f"⏳ スプレッドシート「**{used_sheet_name}**」が見つからないため、指定フォルダに新規作成しています...")
+            
+            url = sheet_manager.create_sheet_via_gas(used_sheet_name)
+            if not url:
+                return None, "❌ GAS経由でのスプレッドシート作成に失敗しました。"
+            
+            await asyncio.sleep(4)
+            try:
+                spreadsheet = gc.open(used_sheet_name)
+            except Exception as e:
+                return None, f"❌ スプレッドシートの作成は成功しましたが、読み込みに失敗しました: {e}"
                     
         return spreadsheet, used_sheet_name
 
@@ -247,16 +261,13 @@ class EntrySheetCog(commands.Cog):
                 if '【演奏者】' not in message.content:
                     continue
 
-                # ==========================================
-                # ★追加：テンプレメッセージ（案内用）を除外
-                # ==========================================
+                # テンプレメッセージ（案内用）を除外
                 title_match = re.search(r'【曲名】([^\n]*)', message.content)
                 temp_title = title_match.group(1).strip() if title_match else ''
                 
                 # 「曲名が空っぽ」かつ「期・氏名・学年 という文字が含まれる」場合は無視する
                 if not temp_title and '期・氏名・学年' in message.content:
                     continue
-                # ==========================================
 
                 try:
                     for reaction in message.reactions:
