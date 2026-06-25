@@ -213,7 +213,7 @@ class StartView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="参加", style=discord.ButtonStyle.success, custom_id="start_join")
+    @discord.ui.button(label="参加", style=discord.ButtonStyle.success, custom_id="start_join")#バッティング回避のため名前変更
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
         role_name, channels_mentions, sheet_url, participants = extract_info_from_message(interaction.message)
         
