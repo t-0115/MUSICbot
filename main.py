@@ -19,7 +19,6 @@ class MyBot(commands.Bot):
         # Cog（機能ごとの別ファイル）を読み込む
         await self.load_extension("cogs.greetings")
         await self.load_extension("cogs.start")
-        #await self.load_extension("cogs.song_recruit")
         await self.load_extension("cogs.song_recruit_slash")
         await self.load_extension("cogs.entry_sheet")
         await self.load_extension("cogs.role_manager")

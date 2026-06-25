@@ -21,7 +21,7 @@ class AnonymousCog(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ エラー: {e}", ephemeral=True)
 
-    # 🔥 1分間に5回の制限を超えて（6回目を）打ったときに発動する処理
+    # 🔥 1分間に5回の制限を超えて6回目を打ったときに発動する処理
     @anonymous_question.error
     async def anonymous_question_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.CommandOnCooldown):
