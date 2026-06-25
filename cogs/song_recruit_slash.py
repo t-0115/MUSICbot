@@ -20,7 +20,7 @@ def get_remaining_capacity(content: str) -> int:
 
 def get_recruiter_id(content: str) -> int:
     """テキストから募集者のDiscord IDを読み取る"""
-    match = re.search(r'募集者:\s*<@!?(\d+)>', content)
+    match = re.search(r'募集者:\\s*<@!?(\\d+)>', content)
     return int(match.group(1)) if match else 0
 
 def get_body_content(content: str) -> str:
@@ -30,6 +30,27 @@ def get_body_content(content: str) -> str:
     if len(lines) >= 2 and ("募集" in lines[0] or "終了" in lines[0] or "締め切り" in lines[0]) and "募集者:" in lines[1]:
         return '\n'.join(lines[2:]).strip()
     return content
+
+def is_player_registered(content: str, name: str) -> bool:
+    """【演奏者】セクション内に、指定された名前が既に登録されているかチェックする"""
+    # entry_sheet.py と同様の正規表現を使って、【演奏者】の枠内だけを正確に抽出
+    match = re.search(r'【演奏者】(.*?)(?=\n【|$)', content, re.DOTALL)
+    if not match:
+        return False
+        
+    players_section = match.group(1).strip()
+    
+    # 切り出した【演奏者】の中身を1行ずつチェックして、完全一致を探す（部分一致の誤爆防止）
+    for line in players_section.splitlines():
+        line = line.strip()
+        # 「・XX期 名前 (学部)」 の形式から名前部分だけを抜き出す
+        m = re.search(r'・\s*\d+\s*期\s+(.*?)\s*(?:[(（]|\Z)', line)
+        if m:
+            registered_name = m.group(1).strip()
+            if registered_name == name.strip():
+                return True
+                
+    return False
 
 def update_recruit_text(content: str, new_remaining: int, new_player_line: str = None, status: str = None) -> str:
     """テキスト内の人数やステータスを更新し、必要なら参加者を追記する"""
@@ -102,7 +123,8 @@ class JoinSongModal(discord.ui.Modal):
 
         latest_content = latest_message.content
 
-        if self.name.value in latest_content:
+        # ⭕ 新判定：【演奏者】セクション内を厳密に精査して重複チェックを行う
+        if is_player_registered(latest_content, self.name.value):
             return await interaction.followup.send('❌ 既に登録されています。', ephemeral=True)
             
         current_remaining = get_remaining_capacity(latest_content)
@@ -319,7 +341,7 @@ class RawTextRecruitModal(discord.ui.Modal):
         capacity = int(self.capacity_input.value)
         raw_val = self.raw_text.value.strip()
         
-        raw_val = re.sub(r'^\s*(?:\d+|[〇零一二三四五六七八九])[人名]?募集\s*\n?', '', raw_val).strip()
+        raw_val = re.sub(r'^\s*(?:\d+|[〇零一二三四五六七八九])[人名]?募集\\s*\\n?', '', raw_val).strip()
         
         base_content = (
             f"**🎵 【あと {capacity} 人募集】**\n"
