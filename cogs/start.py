@@ -213,7 +213,7 @@ class StartView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="参加", style=discord.ButtonStyle.success, custom_id="recruit_join")
+    @discord.ui.button(label="参加", style=discord.ButtonStyle.success, custom_id="start_join")
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
         role_name, channels_mentions, sheet_url, participants = extract_info_from_message(interaction.message)
         
@@ -228,7 +228,7 @@ class StartView(discord.ui.View):
 
         await interaction.response.send_modal(JoinModal(role, role_name, channels_mentions, sheet_url, participants))
 
-    @discord.ui.button(label="参加取り消し", style=discord.ButtonStyle.primary, custom_id="recruit_cancel")
+    @discord.ui.button(label="参加取り消し", style=discord.ButtonStyle.primary, custom_id="start_cancel")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         role_name, channels_mentions, sheet_url, participants = extract_info_from_message(interaction.message)
         
@@ -250,7 +250,7 @@ class StartView(discord.ui.View):
         else:
             await interaction.response.send_message("まだ参加していません。", ephemeral=True)
 
-    @discord.ui.button(label="削除", style=discord.ButtonStyle.danger, custom_id="recruit_delete")
+    @discord.ui.button(label="削除", style=discord.ButtonStyle.danger, custom_id="start_delete")
     async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
         role_name, channels_mentions, _, _ = extract_info_from_message(interaction.message)
         role = discord.utils.get(interaction.guild.roles, name=role_name)
