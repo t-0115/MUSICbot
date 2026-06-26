@@ -20,7 +20,7 @@ def get_remaining_capacity(content: str) -> int:
 
 def get_recruiter_id(content: str) -> int:
     """テキストから募集者のDiscord IDを読み取る"""
-    match = re.search(r'募集者:\\s*<@!?(\\d+)>', content)
+    match = re.search(r'募集者[:：]\s*<@!?(\d+)>', content)
     return int(match.group(1)) if match else 0
 
 def get_body_content(content: str) -> str:
@@ -142,23 +142,32 @@ class JoinSongModal(discord.ui.Modal):
         await latest_message.edit(content=new_content, view=new_view)
 
         recruiter_id = get_recruiter_id(latest_content)
+        print(f"DEBUG: 抽出された募集者ID -> {recruiter_id}") # ★ログ出力
+
         if recruiter_id:
             try:
                 recruiter = await interaction.client.fetch_user(recruiter_id)
                 msg = f"🔔 あなたの募集にエントリーがありました！\n参加者: {player_line}\n"
                 
-                # もしメッセージが入力されていればDMに追記する
-                if self.user_message.value.strip():
+                if getattr(self, 'user_message', None) and self.user_message.value.strip():
                     msg += f"\n💬 **メッセージ:**\n{self.user_message.value.strip()}\n\n"
                 
                 msg += f"{latest_message.jump_url}"
                 
                 if new_remaining <= 0:
                     msg += "\n🎉 **定員に達したため、募集を締め切りました。**"
+                    
                 await recruiter.send(msg)
-            except:
-                pass
-        
+                print("DEBUG: DM送信成功！") # ★ログ出力
+                
+            except discord.Forbidden:
+                print("DEBUG: ユーザー側の設定（Forbidden）でDMが弾かれました")
+                # 必要であれば、ここで「DMが送れませんでした」とフォローアップ送信する
+            except Exception as e:
+                print(f"DEBUG: DM送信中にその他のエラーが発生 -> {e}")
+        else:
+            print("DEBUG: 募集者IDが見つからなかったため、DM処理をスキップしました")
+
         await interaction.followup.send("✅ エントリーが完了しました！", ephemeral=True)
 
 
