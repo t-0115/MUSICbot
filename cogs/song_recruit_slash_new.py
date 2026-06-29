@@ -19,31 +19,27 @@ def get_remaining_capacity(content: str) -> int:
     return int(match.group(1)) if match else 0
 
 def get_recruiter_id(content: str) -> int:
-    """テキストから募集者のDiscord IDを読み取る"""
+    """テキストから募集者のDiscord IDを読み取る（全角コロンにも対応）"""
     match = re.search(r'募集者[:：]\s*<@!?(\d+)>', content)
     return int(match.group(1)) if match else 0
 
 def get_body_content(content: str) -> str:
     """メッセージから自動生成されたヘッダーを除いた本文を抽出する"""
     lines = content.split('\n')
-    # ヘッダー判定に「締め切り」も含めることで仮締め切り時も正しく本文を抽出
-    if len(lines) >= 2 and ("募集" in lines[0] or "終了" in lines[0] or "締め切り" in lines[0]) and "募集者:" in lines[1]:
+    if len(lines) >= 2 and ("募集" in lines[0] or "終了" in lines[0] or "締め切り" in lines[0]) and "募集者" in lines[1]:
         return '\n'.join(lines[2:]).strip()
     return content
 
 def is_player_registered(content: str, name: str) -> bool:
     """【演奏者】セクション内に、指定された名前が既に登録されているかチェックする"""
-    # entry_sheet.py と同様の正規表現を使って、【演奏者】の枠内だけを正確に抽出
     match = re.search(r'【演奏者】(.*?)(?=\n【|$)', content, re.DOTALL)
     if not match:
         return False
         
     players_section = match.group(1).strip()
     
-    # 切り出した【演奏者】の中身を1行ずつチェックして、完全一致を探す（部分一致の誤爆防止）
     for line in players_section.splitlines():
         line = line.strip()
-        # 「・XX期 名前 (学部)」 の形式から名前部分だけを抜き出す
         m = re.search(r'・\s*\d+\s*期\s+(.*?)\s*(?:[(（]|\Z)', line)
         if m:
             registered_name = m.group(1).strip()
@@ -54,7 +50,6 @@ def is_player_registered(content: str, name: str) -> bool:
 
 def update_recruit_text(content: str, new_remaining: int, new_player_line: str = None, status: str = None) -> str:
     """テキスト内の人数やステータスを更新し、必要なら参加者を追記する"""
-    # ステータス指定に合わせてヘッダーを出し分ける
     if status == "temp_closed":
         new_header = "**⏸️ 【仮締め切り】**"
     elif status == "closed":
@@ -64,7 +59,6 @@ def update_recruit_text(content: str, new_remaining: int, new_player_line: str =
     else:
         new_header = f"**🎵 【あと {new_remaining} 人募集】**"
 
-    # 古いヘッダー（🎵、🔒、⏸️）を見つけて差し替える
     if re.search(r'\*\*(?:🎵|🔒|⏸️) 【.*】\*\*', content):
         content = re.sub(r'\*\*(?:🎵|🔒|⏸️) 【.*】\*\*', new_header, content, count=1)
     else:
@@ -82,7 +76,8 @@ def build_recruit_view(remaining: int) -> 'PersistentRecruitView':
     view = PersistentRecruitView()
     is_closed = (remaining <= 0)
     for child in view.children:
-        if getattr(child, 'custom_id', None) == 'recruit_join':
+        # custom_idを修正した新しいボタン名で判定
+        if getattr(child, 'custom_id', None) == 'song_recruit_join':
             child.disabled = is_closed
     return view
 
@@ -98,13 +93,11 @@ class JoinSongModal(discord.ui.Modal):
         self.generation = discord.ui.TextInput(label='期（半角数字のみ）', placeholder='例: 24', max_length=5, required=True)
         self.name = discord.ui.TextInput(label='氏名', placeholder='例: 山田太郎', max_length=20, required=True)
         self.faculty = discord.ui.TextInput(label='学部・学科・学年', placeholder='例: 工情物', max_length=30, required=True)
-        
-        # ★追加：募集者へのメッセージ入力欄（任意）
         self.user_message = discord.ui.TextInput(
             label='募集者へのメッセージ（任意）', 
             style=discord.TextStyle.paragraph,
             placeholder='例: よろしくお願いします！', 
-            required=False, # 入力必須ではない
+            required=False,
             max_length=500
         )
 
@@ -123,7 +116,6 @@ class JoinSongModal(discord.ui.Modal):
 
         latest_content = latest_message.content
 
-        # ⭕ 新判定：【演奏者】セクション内を厳密に精査して重複チェックを行う
         if is_player_registered(latest_content, self.name.value):
             return await interaction.followup.send('❌ 既に登録されています。', ephemeral=True)
             
@@ -134,22 +126,22 @@ class JoinSongModal(discord.ui.Modal):
         new_remaining = current_remaining - 1
         player_line = f"・{self.generation.value.replace('期', '').strip()}期 {self.name.value} ({self.faculty.value})"
         
-        # 定員に達した場合は完全終了(closed)として処理する
         status = "closed" if new_remaining <= 0 else None
         new_content = update_recruit_text(latest_content, new_remaining, player_line, status=status)
         new_view = build_recruit_view(new_remaining)
 
         await latest_message.edit(content=new_content, view=new_view)
 
+        # DM送信とエラーハンドリング
         recruiter_id = get_recruiter_id(latest_content)
-        print(f"DEBUG: 抽出された募集者ID -> {recruiter_id}") # ★ログ出力
-
+        print(f"DEBUG: 抽出された募集者ID -> {recruiter_id}")
+        
         if recruiter_id:
             try:
                 recruiter = await interaction.client.fetch_user(recruiter_id)
                 msg = f"🔔 あなたの募集にエントリーがありました！\n参加者: {player_line}\n"
                 
-                if getattr(self, 'user_message', None) and self.user_message.value.strip():
+                if self.user_message.value.strip():
                     msg += f"\n💬 **メッセージ:**\n{self.user_message.value.strip()}\n\n"
                 
                 msg += f"{latest_message.jump_url}"
@@ -158,17 +150,15 @@ class JoinSongModal(discord.ui.Modal):
                     msg += "\n🎉 **定員に達したため、募集を締め切りました。**"
                     
                 await recruiter.send(msg)
-                print("DEBUG: DM送信成功！") # ★ログ出力
-                
+                print("DEBUG: DM送信成功！")
             except discord.Forbidden:
                 print("DEBUG: ユーザー側の設定（Forbidden）でDMが弾かれました")
-                # 必要であれば、ここで「DMが送れませんでした」とフォローアップ送信する
             except Exception as e:
                 print(f"DEBUG: DM送信中にその他のエラーが発生 -> {e}")
         else:
             print("DEBUG: 募集者IDが見つからなかったため、DM処理をスキップしました")
-
-        await interaction.followup.send("✅ エントリーが完了しました！", ephemeral=True)
+        
+        await interaction.followup.send("✅ 参加が完了しました！", ephemeral=True)
 
 
 class EditCapacityModal(discord.ui.Modal):
@@ -235,7 +225,7 @@ class EditMessageModal(discord.ui.Modal):
 
         lines = latest_message.content.split('\n')
         
-        if len(lines) >= 2 and ("募集" in lines[0] or "終了" in lines[0] or "締め切り" in lines[0]) and "募集者:" in lines[1]:
+        if len(lines) >= 2 and ("募集" in lines[0] or "終了" in lines[0] or "締め切り" in lines[0]) and "募集者" in lines[1]:
             header = lines[0]
             recruiter = lines[1]
             new_content = f"{header}\n{recruiter}\n\n{self.new_body.value.strip()}"
@@ -253,7 +243,7 @@ class PersistentRecruitView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label='参加する', style=discord.ButtonStyle.success, custom_id='recruit_join')
+    @discord.ui.button(label='🟢 参加する', style=discord.ButtonStyle.success, custom_id='song_recruit_join')
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         content = interaction.message.content
         remaining = get_remaining_capacity(content)
@@ -263,66 +253,56 @@ class PersistentRecruitView(discord.ui.View):
             
         await interaction.response.send_modal(JoinSongModal(interaction.message))
 
-    @discord.ui.button(label='⚙️ 管理 / 編集', style=discord.ButtonStyle.primary, custom_id='recruit_edit')
-    async def edit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label='📝 本文編集', style=discord.ButtonStyle.secondary, custom_id='song_recruit_edit_msg')
+    async def edit_msg_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        content = interaction.message.content
+        recruiter_id = get_recruiter_id(content)
+        
+        if recruiter_id and interaction.user.id != recruiter_id:
+            return await interaction.response.send_message('❌ 募集を立ち上げた本人のみ操作可能です。', ephemeral=True)
+            
+        await interaction.response.send_modal(EditMessageModal(interaction.message))
+
+    @discord.ui.button(label='👥 人数変更', style=discord.ButtonStyle.secondary, custom_id='song_recruit_edit_cap')
+    async def edit_cap_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         content = interaction.message.content
         recruiter_id = get_recruiter_id(content)
         
         if recruiter_id and interaction.user.id != recruiter_id:
             return await interaction.response.send_message('❌ 募集を立ち上げた本人のみ操作可能です。', ephemeral=True)
 
-        view = discord.ui.View()
-        
-        edit_msg_btn = discord.ui.Button(label="本文を編集する", style=discord.ButtonStyle.primary)
-        async def edit_msg_callback(i: discord.Interaction):
-            latest_msg = await i.channel.fetch_message(interaction.message.id)
-            await i.response.send_modal(EditMessageModal(latest_msg))
-        edit_msg_btn.callback = edit_msg_callback
+        remaining = get_remaining_capacity(content)
+        await interaction.response.send_modal(EditCapacityModal(interaction.message, remaining))
 
-        edit_cap_btn = discord.ui.Button(label="募集人数を変更する", style=discord.ButtonStyle.success)
-        async def edit_cap_callback(i: discord.Interaction):
-            latest_msg = await i.channel.fetch_message(interaction.message.id)
-            remaining = get_remaining_capacity(latest_msg.content)
-            await i.response.send_modal(EditCapacityModal(latest_msg, remaining))
-        edit_cap_btn.callback = edit_cap_callback
+    @discord.ui.button(label='⏸️ 停止/再開', style=discord.ButtonStyle.primary, custom_id='song_recruit_toggle')
+    async def toggle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        content = interaction.message.content
+        recruiter_id = get_recruiter_id(content)
         
-        if is_recruit_closed(content):
-            # 募集終了 or 仮締め切り 状態の場合
-            toggle_btn = discord.ui.Button(label="募集を再開する", style=discord.ButtonStyle.success)
-            async def toggle_callback(i: discord.Interaction):
-                latest_msg = await i.channel.fetch_message(interaction.message.id)
-                new_content = update_recruit_text(latest_msg.content, 1)
-                await latest_msg.edit(content=new_content, view=build_recruit_view(1))
-                await i.response.edit_message(content="✅ 募集を再開しました！(必要に応じて「人数を変更する」から調整してください)", view=None)
-            toggle_btn.callback = toggle_callback
-            
-            view.add_item(edit_msg_btn)
-            view.add_item(edit_cap_btn)
-            view.add_item(toggle_btn)
+        if recruiter_id and interaction.user.id != recruiter_id:
+            return await interaction.response.send_message('❌ 募集を立ち上げた本人のみ操作可能です。', ephemeral=True)
+
+        is_closed = is_recruit_closed(content)
+        if is_closed:
+            new_content = update_recruit_text(content, 1)
+            await interaction.message.edit(content=new_content, view=build_recruit_view(1))
+            await interaction.response.send_message("✅ 募集を再開しました！(必要に応じて「👥 人数変更」から調整してください)", ephemeral=True)
         else:
-            # 募集中 の場合
-            temp_close_btn = discord.ui.Button(label="仮締め切りにする", style=discord.ButtonStyle.primary)
-            async def temp_close_callback(i: discord.Interaction):
-                latest_msg = await i.channel.fetch_message(interaction.message.id)
-                new_content = update_recruit_text(latest_msg.content, 0, status="temp_closed")
-                await latest_msg.edit(content=new_content, view=build_recruit_view(0))
-                await i.response.edit_message(content="✅ 募集を仮締め切りにしました！", view=None)
-            temp_close_btn.callback = temp_close_callback
+            new_content = update_recruit_text(content, 0, status="temp_closed")
+            await interaction.message.edit(content=new_content, view=build_recruit_view(0))
+            await interaction.response.send_message("✅ 募集を仮締め切りにしました！", ephemeral=True)
 
-            close_btn = discord.ui.Button(label="完全に締め切る", style=discord.ButtonStyle.danger)
-            async def close_callback(i: discord.Interaction):
-                latest_msg = await i.channel.fetch_message(interaction.message.id)
-                new_content = update_recruit_text(latest_msg.content, 0, status="closed")
-                await latest_msg.edit(content=new_content, view=build_recruit_view(0))
-                await i.response.edit_message(content="✅ 募集を締め切りました！", view=None)
-            close_btn.callback = close_callback
+    @discord.ui.button(label='🔒 終了', style=discord.ButtonStyle.danger, custom_id='song_recruit_close')
+    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        content = interaction.message.content
+        recruiter_id = get_recruiter_id(content)
+        
+        if recruiter_id and interaction.user.id != recruiter_id:
+            return await interaction.response.send_message('❌ 募集を立ち上げた本人のみ操作可能です。', ephemeral=True)
 
-            view.add_item(edit_msg_btn)
-            view.add_item(edit_cap_btn)
-            view.add_item(temp_close_btn)
-            view.add_item(close_btn)
-
-        await interaction.response.send_message("🔧 **募集の管理**\n行いたい操作を選んでください。", view=view, ephemeral=True)
+        new_content = update_recruit_text(content, 0, status="closed")
+        await interaction.message.edit(content=new_content, view=build_recruit_view(0))
+        await interaction.response.send_message("✅ 募集を完全に締め切りました！", ephemeral=True)
 
 
 # ==========================================
@@ -350,7 +330,7 @@ class RawTextRecruitModal(discord.ui.Modal):
         capacity = int(self.capacity_input.value)
         raw_val = self.raw_text.value.strip()
         
-        raw_val = re.sub(r'^\s*(?:\d+|[〇零一二三四五六七八九])[人名]?募集\\s*\\n?', '', raw_val).strip()
+        raw_val = re.sub(r'^\s*(?:\d+|[〇零一二三四五六七八九])[人名]?募集\s*\n?', '', raw_val).strip()
         
         base_content = (
             f"**🎵 【あと {capacity} 人募集】**\n"
