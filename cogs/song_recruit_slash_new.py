@@ -290,7 +290,7 @@ class PersistentRecruitView(discord.ui.View):
         else:
             new_content = update_recruit_text(content, 0, status="temp_closed")
             await interaction.message.edit(content=new_content, view=build_recruit_view(0))
-            await interaction.response.send_message("✅ 募集を仮締め切りにしました！", ephemeral=True)
+            await interaction.response.send_message("✅ 募集を一時停止しました！", ephemeral=True)
 
     @discord.ui.button(label='🔒 終了', style=discord.ButtonStyle.danger, custom_id='song_recruit_close')
     async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -302,7 +302,7 @@ class PersistentRecruitView(discord.ui.View):
 
         new_content = update_recruit_text(content, 0, status="closed")
         await interaction.message.edit(content=new_content, view=build_recruit_view(0))
-        await interaction.response.send_message("✅ 募集を完全に締め切りました！", ephemeral=True)
+        await interaction.response.send_message("✅ 募集を締め切りました！エントリーチャンネルにメッセージを送信してください！", ephemeral=True)
 
 
 # ==========================================
