@@ -131,7 +131,7 @@ class EntrySheetCog(commands.Cog):
     @app_commands.command(name='曲数カウント', description='参加者の演奏曲数をカウントします（未指定で全体の曲数を出力）')
     @app_commands.describe(user="特定の人のみカウントしたい場合はメンション（未指定で全体の曲数を表示）")
     async def count_songs(self, interaction: discord.Interaction, user: discord.Member = None):
-        await interaction.response.defer(ephemeral=False)
+        await interaction.response.defer(ephemeral=True)
 
         spreadsheet, result = await self._get_spreadsheet(interaction, create_if_missing=False)
         if not spreadsheet:
@@ -201,7 +201,7 @@ class EntrySheetCog(commands.Cog):
 
     @app_commands.command(name='エントリー集計', description='チャンネルの権限ロールと同じスプシを探し（無ければ作成して）転記します')
     async def export_entries(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=False)
+        await interaction.response.defer(ephemeral=True)
 
         spreadsheet, result = await self._get_spreadsheet(interaction, create_if_missing=True)
         if not spreadsheet:
@@ -313,14 +313,14 @@ class EntrySheetCog(commands.Cog):
             worksheet.append_row(headers)
             worksheet.append_rows(extracted_data)
 
-            for msg, has_warning in extracted_messages:
-                try:
-                    if has_warning:
-                        await msg.add_reaction('⚠️')
-                    else:
-                        await msg.add_reaction('☑️')
-                except discord.HTTPException:
-                    pass
+            # for msg, has_warning in extracted_messages:
+            #     try:
+            #         if has_warning:
+            #             await msg.add_reaction('⚠️')
+            #         else:
+            #             await msg.add_reaction('☑️')
+            #     except discord.HTTPException:
+            #         pass
 
             summary = (
                 f"✅ 集計完了！\n"
@@ -337,7 +337,7 @@ class EntrySheetCog(commands.Cog):
             if len(summary) > 1950:
                 summary = summary[:1900] + "\n...（文字数制限のため省略されました）"
 
-            await interaction.followup.send(summary)
+            await interaction.followup.send(summary, ephemeral=True)
 
         except Exception as e:
             await interaction.followup.send(f"❌ 転記処理中にエラーが発生しました: {e}")
