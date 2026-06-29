@@ -92,7 +92,7 @@ class JoinSongModal(discord.ui.Modal):
 
         self.generation = discord.ui.TextInput(label='期（半角数字のみ）', placeholder='例: 24', max_length=5, required=True)
         self.name = discord.ui.TextInput(label='氏名', placeholder='例: 山田太郎', max_length=20, required=True)
-        self.faculty = discord.ui.TextInput(label='学部・学科・学年', placeholder='例: 工情物', max_length=30, required=True)
+        self.faculty = discord.ui.TextInput(label='学部・学科・学年', placeholder='例: 工情物B2', max_length=30, required=True)
         self.user_message = discord.ui.TextInput(
             label='募集者へのメッセージ（任意）', 
             style=discord.TextStyle.paragraph,
