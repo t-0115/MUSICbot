@@ -4,6 +4,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from .sheet_manager import append_to_sheet, delete_spreadsheet, create_sheet_via_gas, remove_from_sheet
+from .lock_manager import message_lock_manager as _lock_manager
+
 
 # ==========================================
 # ヘルパー関数 (メッセージから状態を復元・生成)
@@ -133,54 +135,69 @@ class ChannelNamingModal(discord.ui.Modal):
             await interaction.followup.send(f"❌ エラーが発生しました: {e}", ephemeral=True)
 
 class JoinModal(discord.ui.Modal, title='参加者情報の入力'):
-    # 【変更点】名字と名前を別々の入力欄に分割
     term_input = discord.ui.TextInput(label='期 (2桁)', placeholder='例：24', min_length=1, max_length=2)
     last_name_input = discord.ui.TextInput(label='名字', placeholder='例：山田', max_length=15)
     first_name_input = discord.ui.TextInput(label='名前', placeholder='例：太郎', max_length=15)
 
-    def __init__(self, role: discord.Role, role_name: str, channels_mentions: str, sheet_url: str, participants: dict):
+    def __init__(self, role: discord.Role, role_name: str, channels_mentions: str, sheet_url: str, participants: dict, message_id: int):
         super().__init__()
         self.role = role
         self.role_name = role_name
         self.channels_mentions = channels_mentions
         self.sheet_url = sheet_url
         self.participants = participants
+        self.message_id = message_id  # ★ ロック解放に使う
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not self.term_input.value.isdigit():
-            await interaction.response.send_message("❌ 期は数字で入力してください。", ephemeral=True)
-            return
-            
-        term = self.term_input.value.zfill(2)
-        last_name = self.last_name_input.value
-        first_name = self.first_name_input.value
-        
-        # Discordのメッセージ表示用には結合する
-        user_name_combined = f"{last_name} {first_name}"
-        discord_id = interaction.user.id
-        
-        # 参加情報を追加（DiscordのEmbed表示用）
-        self.participants[discord_id] = {"name": user_name_combined, "term": term}
-        await interaction.user.add_roles(self.role)
-        
-        # メッセージを新しいEmbedで更新
-        new_embed = create_embed(self.role_name, self.channels_mentions, self.sheet_url, self.participants)
-        await interaction.message.edit(embed=new_embed)
-        
-        await interaction.response.send_message(f"【{term}期】{user_name_combined}として参加登録しました！", ephemeral=True)
-
+        # モーダル送信時点でロックを取得して最新状態を再確認する
+        # （ボタン押下〜モーダル入力の間に他者が登録した可能性があるため）
         try:
-            # 【変更点】スプレッドシートへは名字と名前を分けて送信 (discord_tagを削除)
-            append_to_sheet(
-                role_name=self.role_name,
-                term=term,
-                last_name=last_name,
-                first_name=first_name,
-                discord_id=discord_id
-            )
+            async with _lock_manager.get_context(self.message_id):
+                # ★ ロック内でメッセージを再フェッチして最新の参加者リストを取得
+                fresh_message = await interaction.channel.fetch_message(self.message_id)
+                _, _, _, fresh_participants = extract_info_from_message(fresh_message)
+
+                if interaction.user.id in fresh_participants:
+                    await interaction.response.send_message("❌ 既に登録されています！（送信中に別の操作が完了しました）", ephemeral=True)
+                    return
+
+                if not self.term_input.value.isdigit():
+                    await interaction.response.send_message("❌ 期は数字で入力してください。", ephemeral=True)
+                    return
+
+                term = self.term_input.value.zfill(2)
+                last_name = self.last_name_input.value
+                first_name = self.first_name_input.value
+                user_name_combined = f"{last_name} {first_name}"
+                discord_id = interaction.user.id
+
+                fresh_participants[discord_id] = {"name": user_name_combined, "term": term}
+                await interaction.user.add_roles(self.role)
+
+                new_embed = create_embed(self.role_name, self.channels_mentions, self.sheet_url, fresh_participants)
+                # ★ ロック内でメッセージを更新（他の操作と順序が保証される）
+                await fresh_message.edit(embed=new_embed)
+
+            # ロック解放後にユーザーへ応答（editが完了してから通知）
+            await interaction.response.send_message(f"【{term}期】{user_name_combined}として参加登録しました！", ephemeral=True)
+
+            try:
+                append_to_sheet(
+                    role_name=self.role_name,
+                    term=term,
+                    last_name=last_name,
+                    first_name=first_name,
+                    discord_id=discord_id
+                )
+            except Exception as e:
+                print(f"Spreadsheet Error: {e}")
+                await interaction.followup.send("⚠️ （システム通知）スプレッドシートへの記録に失敗しました。", ephemeral=True)
+
+        except discord.NotFound:
+            await interaction.response.send_message("❌ 募集メッセージが見つかりません。削除された可能性があります。", ephemeral=True)
         except Exception as e:
-            print(f"Spreadsheet Error: {e}")
-            await interaction.followup.send("⚠️ （システム通知）スプレッドシートへの記録に失敗しました。", ephemeral=True)
+            await interaction.response.send_message(f"❌ 予期せぬエラーが発生しました: {e}", ephemeral=True)
+
 
 class DeleteConfirmModal(discord.ui.Modal, title='⚠️ 削除の最終確認'):
     dummy = discord.ui.TextInput(label='そのまま送信で削除', placeholder='何も入力せず送信を押してください', required=False)
@@ -213,42 +230,57 @@ class StartView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="参加", style=discord.ButtonStyle.success, custom_id="start_join")#バッティング回避のためstartに変更
+    @discord.ui.button(label="参加", style=discord.ButtonStyle.success, custom_id="start_join")
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
-        role_name, channels_mentions, sheet_url, participants = extract_info_from_message(interaction.message)
-        
-        if interaction.user.id in participants:
-            await interaction.response.send_message("❌ 既に登録されています！", ephemeral=True)
-            return
-            
-        role = discord.utils.get(interaction.guild.roles, name=role_name)
-        if not role:
-            await interaction.response.send_message("❌ 対象のロールが見つかりません。削除された可能性があります。", ephemeral=True)
-            return
+        message_id = interaction.message.id
 
-        await interaction.response.send_modal(JoinModal(role, role_name, channels_mentions, sheet_url, participants))
+        # ★ ボタン押下時点でロックを取得して重複登録チェック
+        async with _lock_manager.get_context(message_id):
+            role_name, channels_mentions, sheet_url, participants = extract_info_from_message(interaction.message)
+
+            if interaction.user.id in participants:
+                await interaction.response.send_message("❌ 既に登録されています！", ephemeral=True)
+                return
+
+            role = discord.utils.get(interaction.guild.roles, name=role_name)
+            if not role:
+                await interaction.response.send_message("❌ 対象のロールが見つかりません。削除された可能性があります。", ephemeral=True)
+                return
+
+            # ★ モーダルを開く（ロックはここで解放される。on_submit内で再取得する）
+            await interaction.response.send_modal(
+                JoinModal(role, role_name, channels_mentions, sheet_url, participants, message_id)
+            )
 
     @discord.ui.button(label="参加取り消し", style=discord.ButtonStyle.primary, custom_id="start_cancel")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        role_name, channels_mentions, sheet_url, participants = extract_info_from_message(interaction.message)
-        
-        if interaction.user.id in participants:
+        message_id = interaction.message.id
+
+        # ★ ロック内で参加者リストを読み取り・更新・メッセージ編集を一括実行
+        async with _lock_manager.get_context(message_id):
+            # 最新のメッセージを再フェッチして状態を取得
+            fresh_message = await interaction.channel.fetch_message(message_id)
+            role_name, channels_mentions, sheet_url, participants = extract_info_from_message(fresh_message)
+
+            if interaction.user.id not in participants:
+                await interaction.response.send_message("まだ参加していません。", ephemeral=True)
+                return
+
             del participants[interaction.user.id]
-            
+
             role = discord.utils.get(interaction.guild.roles, name=role_name)
             if role:
                 await interaction.user.remove_roles(role)
-                
+
             new_embed = create_embed(role_name, channels_mentions, sheet_url, participants)
-            await interaction.message.edit(embed=new_embed)
-            await interaction.response.send_message("参加を取り消しました。", ephemeral=True)
-            
-            try:
-                remove_from_sheet(role_name, interaction.user.id)
-            except Exception as e:
-                print(f"行削除時のエラー: {e}")
-        else:
-            await interaction.response.send_message("まだ参加していません。", ephemeral=True)
+            await fresh_message.edit(embed=new_embed)
+
+        await interaction.response.send_message("参加を取り消しました。", ephemeral=True)
+
+        try:
+            remove_from_sheet(role_name, interaction.user.id)
+        except Exception as e:
+            print(f"行削除時のエラー: {e}")
 
     @discord.ui.button(label="削除", style=discord.ButtonStyle.danger, custom_id="start_delete")
     async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):

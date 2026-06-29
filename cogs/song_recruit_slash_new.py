@@ -3,6 +3,8 @@ import re
 import discord
 from discord import app_commands
 from discord.ext import commands
+from .lock_manager import message_lock_manager as _lock_manager
+
 
 # ==========================================
 # テキスト解析・更新ヘルパー
@@ -12,7 +14,7 @@ def is_recruit_closed(content: str) -> bool:
     return "🔒" in content or "【募集終了】" in content or "⏸️" in content or "【仮締め切り】" in content
 
 def get_remaining_capacity(content: str) -> int:
-    """テキストから「あと◯人」の数字を読み取る（★募集終了・仮締め切り時は確実に0として扱う）"""
+    """テキストから「あと◯人」の数字を読み取る（募集終了・仮締め切り時は確実に0として扱う）"""
     if is_recruit_closed(content):
         return 0
     match = re.search(r'あと\s*(\d+)\s*人', content)
@@ -76,7 +78,6 @@ def build_recruit_view(remaining: int) -> 'PersistentRecruitView':
     view = PersistentRecruitView()
     is_closed = (remaining <= 0)
     for child in view.children:
-        # custom_idを修正した新しいボタン名で判定
         if getattr(child, 'custom_id', None) == 'song_recruit_join':
             child.disabled = is_closed
     return view
@@ -109,31 +110,41 @@ class JoinSongModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
-        try:
-            latest_message = await interaction.channel.fetch_message(self.target_message.id)
-        except discord.NotFound:
-            return await interaction.followup.send('❌ 元のメッセージが見つかりません。', ephemeral=True)
+        message_id = self.target_message.id
 
-        latest_content = latest_message.content
+        # ★ ロック内で「再フェッチ→チェック→更新」を一括実行
+        #　 モーダル入力中に他者が参加して残数が変わっていても正確に検出できる
+        async with _lock_manager.get_context(message_id):
+            try:
+                latest_message = await interaction.channel.fetch_message(message_id)
+            except discord.NotFound:
+                return await interaction.followup.send('❌ 元のメッセージが見つかりません。', ephemeral=True)
 
-        if is_player_registered(latest_content, self.name.value):
-            return await interaction.followup.send('❌ 既に登録されています。', ephemeral=True)
+            latest_content = latest_message.content
+
+            # ★ ロック取得後に最新状態で重複・締切チェック
+            if is_player_registered(latest_content, self.name.value):
+                return await interaction.followup.send('❌ 既に登録されています。', ephemeral=True)
+                
+            current_remaining = get_remaining_capacity(latest_content)
+            if is_recruit_closed(latest_content) or current_remaining <= 0:
+                return await interaction.followup.send('❌ 申し訳ありません、タッチの差で定員が埋まり募集が締め切られました。', ephemeral=True)
+
+            new_remaining = current_remaining - 1
+            player_line = f"・{self.generation.value.replace('期', '').strip()}期 {self.name.value} ({self.faculty.value})"
             
-        current_remaining = get_remaining_capacity(latest_content)
-        if is_recruit_closed(latest_content) or current_remaining <= 0:
-            return await interaction.followup.send('❌ 申し訳ありません、タッチの差で定員が埋まり募集が締め切られました。', ephemeral=True)
+            status = "closed" if new_remaining <= 0 else None
+            new_content = update_recruit_text(latest_content, new_remaining, player_line, status=status)
+            new_view = build_recruit_view(new_remaining)
 
-        new_remaining = current_remaining - 1
-        player_line = f"・{self.generation.value.replace('期', '').strip()}期 {self.name.value} ({self.faculty.value})"
-        
-        status = "closed" if new_remaining <= 0 else None
-        new_content = update_recruit_text(latest_content, new_remaining, player_line, status=status)
-        new_view = build_recruit_view(new_remaining)
+            # ★ ロック内でメッセージを更新
+            await latest_message.edit(content=new_content, view=new_view)
 
-        await latest_message.edit(content=new_content, view=new_view)
+            # DM送信はロック外でもよいが、recruiter_idをロック内で取得しておく
+            recruiter_id = get_recruiter_id(latest_content)
+            jump_url = latest_message.jump_url
 
-        # DM送信とエラーハンドリング
-        recruiter_id = get_recruiter_id(latest_content)
+        # ロック解放後にDM送信（時間のかかる外部通信はロック外で行う）
         print(f"DEBUG: 抽出された募集者ID -> {recruiter_id}")
         
         if recruiter_id:
@@ -144,7 +155,7 @@ class JoinSongModal(discord.ui.Modal):
                 if self.user_message.value.strip():
                     msg += f"\n💬 **メッセージ:**\n{self.user_message.value.strip()}\n\n"
                 
-                msg += f"{latest_message.jump_url}"
+                msg += jump_url
                 
                 if new_remaining <= 0:
                     msg += "\n🎉 **定員に達したため、募集を締め切りました。**"
@@ -181,17 +192,19 @@ class EditCapacityModal(discord.ui.Modal):
 
         await interaction.response.defer(ephemeral=True)
         
-        try:
-            latest_message = await interaction.channel.fetch_message(self.target_message.id)
-        except discord.NotFound:
-            return await interaction.followup.send('❌ メッセージが見つかりません。', ephemeral=True)
+        # ★ 人数変更もロックで保護（参加と同時実行されると残数がズレるため）
+        async with _lock_manager.get_context(self.target_message.id):
+            try:
+                latest_message = await interaction.channel.fetch_message(self.target_message.id)
+            except discord.NotFound:
+                return await interaction.followup.send('❌ メッセージが見つかりません。', ephemeral=True)
 
-        new_remaining = int(self.new_capacity.value)
-        status = "closed" if new_remaining == 0 else None
-        new_content = update_recruit_text(latest_message.content, new_remaining, status=status)
-        new_view = build_recruit_view(new_remaining)
+            new_remaining = int(self.new_capacity.value)
+            status = "closed" if new_remaining == 0 else None
+            new_content = update_recruit_text(latest_message.content, new_remaining, status=status)
+            new_view = build_recruit_view(new_remaining)
 
-        await latest_message.edit(content=new_content, view=new_view)
+            await latest_message.edit(content=new_content, view=new_view)
         
         if new_remaining == 0:
             await interaction.followup.send('✅ 募集人数を0人に変更し、締め切りました！', ephemeral=True)
@@ -218,21 +231,24 @@ class EditMessageModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
-        try:
-            latest_message = await interaction.channel.fetch_message(self.target_message.id)
-        except discord.NotFound:
-            return await interaction.followup.send('❌ メッセージが見つかりません。', ephemeral=True)
+        # ★ 本文編集もロックで保護（参加と同時実行で演奏者リストが消える事故を防ぐ）
+        async with _lock_manager.get_context(self.target_message.id):
+            try:
+                latest_message = await interaction.channel.fetch_message(self.target_message.id)
+            except discord.NotFound:
+                return await interaction.followup.send('❌ メッセージが見つかりません。', ephemeral=True)
 
-        lines = latest_message.content.split('\n')
-        
-        if len(lines) >= 2 and ("募集" in lines[0] or "終了" in lines[0] or "締め切り" in lines[0]) and "募集者" in lines[1]:
-            header = lines[0]
-            recruiter = lines[1]
-            new_content = f"{header}\n{recruiter}\n\n{self.new_body.value.strip()}"
-        else:
-            new_content = self.new_body.value.strip()
+            lines = latest_message.content.split('\n')
+            
+            if len(lines) >= 2 and ("募集" in lines[0] or "終了" in lines[0] or "締め切り" in lines[0]) and "募集者" in lines[1]:
+                header = lines[0]
+                recruiter = lines[1]
+                new_content = f"{header}\n{recruiter}\n\n{self.new_body.value.strip()}"
+            else:
+                new_content = self.new_body.value.strip()
 
-        await latest_message.edit(content=new_content)
+            await latest_message.edit(content=new_content)
+
         await interaction.followup.send('✅ メッセージの本文を上書き更新しました！', ephemeral=True)
 
 
@@ -245,13 +261,21 @@ class PersistentRecruitView(discord.ui.View):
 
     @discord.ui.button(label='🟢 参加する', style=discord.ButtonStyle.success, custom_id='song_recruit_join')
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        content = interaction.message.content
-        remaining = get_remaining_capacity(content)
-        
-        if is_recruit_closed(content) or remaining <= 0:
-            return await interaction.response.send_message("❌ この募集は既に締め切られています。", ephemeral=True)
+        # ★ ボタン押下時点でも最新状態を確認（キャッシュが古い場合への保険）
+        async with _lock_manager.get_context(interaction.message.id):
+            try:
+                latest_message = await interaction.channel.fetch_message(interaction.message.id)
+            except discord.NotFound:
+                return await interaction.response.send_message("❌ 募集メッセージが見つかりません。", ephemeral=True)
+
+            content = latest_message.content
+            remaining = get_remaining_capacity(content)
             
-        await interaction.response.send_modal(JoinSongModal(interaction.message))
+            if is_recruit_closed(content) or remaining <= 0:
+                return await interaction.response.send_message("❌ この募集は既に締め切られています。", ephemeral=True)
+            
+            # モーダルを開く（ロックはここで解放。on_submit内で再取得する）
+            await interaction.response.send_modal(JoinSongModal(latest_message))
 
     @discord.ui.button(label='📝 本文編集', style=discord.ButtonStyle.secondary, custom_id='song_recruit_edit_msg')
     async def edit_msg_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -282,15 +306,24 @@ class PersistentRecruitView(discord.ui.View):
         if recruiter_id and interaction.user.id != recruiter_id:
             return await interaction.response.send_message('❌ 募集を立ち上げた本人のみ操作可能です。', ephemeral=True)
 
-        is_closed = is_recruit_closed(content)
-        if is_closed:
-            new_content = update_recruit_text(content, 1)
-            await interaction.message.edit(content=new_content, view=build_recruit_view(1))
-            await interaction.response.send_message("✅ 募集を再開しました！(必要に応じて「👥 人数変更」から調整してください)", ephemeral=True)
-        else:
-            new_content = update_recruit_text(content, 0, status="temp_closed")
-            await interaction.message.edit(content=new_content, view=build_recruit_view(0))
-            await interaction.response.send_message("✅ 募集を一時停止しました！", ephemeral=True)
+        # ★ 停止/再開もロックで保護（二重停止・二重再開を防ぐ）
+        async with _lock_manager.get_context(interaction.message.id):
+            try:
+                latest_message = await interaction.channel.fetch_message(interaction.message.id)
+            except discord.NotFound:
+                return await interaction.response.send_message("❌ 募集メッセージが見つかりません。", ephemeral=True)
+
+            latest_content = latest_message.content
+            is_closed = is_recruit_closed(latest_content)
+
+            if is_closed:
+                new_content = update_recruit_text(latest_content, 1)
+                await latest_message.edit(content=new_content, view=build_recruit_view(1))
+                await interaction.response.send_message("✅ 募集を再開しました！(必要に応じて「👥 人数変更」から調整してください)", ephemeral=True)
+            else:
+                new_content = update_recruit_text(latest_content, 0, status="temp_closed")
+                await latest_message.edit(content=new_content, view=build_recruit_view(0))
+                await interaction.response.send_message("✅ 募集を一時停止しました！", ephemeral=True)
 
     @discord.ui.button(label='🔒 終了', style=discord.ButtonStyle.danger, custom_id='song_recruit_close')
     async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -300,8 +333,17 @@ class PersistentRecruitView(discord.ui.View):
         if recruiter_id and interaction.user.id != recruiter_id:
             return await interaction.response.send_message('❌ 募集を立ち上げた本人のみ操作可能です。', ephemeral=True)
 
-        new_content = update_recruit_text(content, 0, status="closed")
-        await interaction.message.edit(content=new_content, view=build_recruit_view(0))
+        # ★ 終了もロックで保護（参加と同時実行で終了後に参加されてしまう事故を防ぐ）
+        async with _lock_manager.get_context(interaction.message.id):
+            try:
+                latest_message = await interaction.channel.fetch_message(interaction.message.id)
+            except discord.NotFound:
+                return await interaction.response.send_message("❌ 募集メッセージが見つかりません。", ephemeral=True)
+
+            latest_content = latest_message.content
+            new_content = update_recruit_text(latest_content, 0, status="closed")
+            await latest_message.edit(content=new_content, view=build_recruit_view(0))
+
         await interaction.response.send_message("✅ 募集を締め切りました！エントリーチャンネルにメッセージを送信してください！", ephemeral=True)
 
 

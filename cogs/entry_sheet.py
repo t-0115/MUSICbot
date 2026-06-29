@@ -6,8 +6,19 @@ import re
 import gspread
 import asyncio
 import unicodedata
+import logging
+from typing import NamedTuple
 
 from . import sheet_manager
+
+logger = logging.getLogger(__name__)
+
+
+# _get_spreadsheet の戻り値を明示的な型で定義
+class SpreadsheetResult(NamedTuple):
+    spreadsheet: object   # gspread.Spreadsheet | None
+    sheet_name: str       # 成功時: シート名、失敗時: エラーメッセージ
+    success: bool
 
 # ==========================================
 # 抽出ヘルパー
@@ -28,6 +39,7 @@ def parse_entry_message(text: str, master_names: dict, last_name_map: dict) -> d
             continue
         
         line = unicodedata.normalize('NFKC', line)
+        line = line.replace('\u3000', ' ')  # NFKC後も残りうる全角スペースを除去
         
         term_match = re.search(r'(\d+)期', line)
         fallback_term = term_match.group(1) if term_match else ""
@@ -71,7 +83,7 @@ class EntrySheetCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    async def _get_spreadsheet(self, interaction: discord.Interaction, create_if_missing: bool):
+    async def _get_spreadsheet(self, interaction: discord.Interaction, create_if_missing: bool) -> SpreadsheetResult:
         target_role_name = None
         for target, overwrite in interaction.channel.overwrites.items():
             if isinstance(target, discord.Role):
@@ -87,7 +99,7 @@ class EntrySheetCog(commands.Cog):
         try:
             gc = sheet_manager.get_gspread_client()
         except Exception as e:
-            return None, f"❌ Google認証エラーが発生しました: {e}"
+            return SpreadsheetResult(None, f"❌ Google認証エラーが発生しました: {e}", False)
 
         spreadsheet = None
         used_sheet_name = fallback_name
@@ -111,32 +123,33 @@ class EntrySheetCog(commands.Cog):
         # ③ どちらでも見つからなかった場合は新規作成
         if not spreadsheet:
             if not create_if_missing:
-                return None, f"⚠️ スプレッドシートが見つかりません。先に `/エントリー集計` を行ってください。"
+                return SpreadsheetResult(None, "⚠️ スプレッドシートが見つかりません。先に `/エントリー集計` を行ってください。", False)
             
             used_sheet_name = fallback_name
             await interaction.followup.send(f"⏳ スプレッドシート「**{used_sheet_name}**」が見つからないため、指定フォルダに新規作成しています...")
             
             url = sheet_manager.create_sheet_via_gas(used_sheet_name)
             if not url:
-                return None, "❌ GAS経由でのスプレッドシート作成に失敗しました。"
+                return SpreadsheetResult(None, "❌ GAS経由でのスプレッドシート作成に失敗しました。", False)
             
             await asyncio.sleep(4)
             try:
                 spreadsheet = gc.open(used_sheet_name)
             except Exception as e:
-                return None, f"❌ スプレッドシートの作成は成功しましたが、読み込みに失敗しました: {e}"
+                return SpreadsheetResult(None, f"❌ スプレッドシートの作成は成功しましたが、読み込みに失敗しました: {e}", False)
                     
-        return spreadsheet, used_sheet_name
+        return SpreadsheetResult(spreadsheet, used_sheet_name, True)
 
     @app_commands.command(name='曲数カウント', description='参加者の演奏曲数をカウントします（未指定で全体の曲数を出力）')
     @app_commands.describe(user="特定の人のみカウントしたい場合はメンション（未指定で全体の曲数を表示）")
     async def count_songs(self, interaction: discord.Interaction, user: discord.Member = None):
         await interaction.response.defer(ephemeral=True)
 
-        spreadsheet, result = await self._get_spreadsheet(interaction, create_if_missing=False)
-        if not spreadsheet:
-            await interaction.followup.send(result)
+        result = await self._get_spreadsheet(interaction, create_if_missing=False)
+        if not result.success:
+            await interaction.followup.send(result.sheet_name)
             return
+        spreadsheet = result.spreadsheet
 
         worksheets = spreadsheet.worksheets()
         if len(worksheets) < 2:
@@ -203,11 +216,12 @@ class EntrySheetCog(commands.Cog):
     async def export_entries(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
-        spreadsheet, result = await self._get_spreadsheet(interaction, create_if_missing=True)
-        if not spreadsheet:
-            await interaction.followup.send(result)
+        result = await self._get_spreadsheet(interaction, create_if_missing=True)
+        if not result.success:
+            await interaction.followup.send(result.sheet_name)
             return
-        used_sheet_name = result
+        spreadsheet = result.spreadsheet
+        used_sheet_name = result.sheet_name
 
         master_names = {}
         last_name_map = {}
