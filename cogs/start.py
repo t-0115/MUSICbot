@@ -1,10 +1,57 @@
 # cogs/start.py
 import re
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
 from .sheet_manager import append_to_sheet, delete_spreadsheet, create_sheet_via_gas, remove_from_sheet
-from .lock_manager import message_lock_manager as _lock_manager
+
+# ==========================================
+# 排他制御用ロックマネージャー
+# ==========================================
+class MessageLockManager:
+    """メッセージIDごとにasyncio.Lockを管理するクラス。
+    同一メッセージへの並行操作（参加・取消の同時押し等）を防ぐ。"""
+
+    def __init__(self):
+        self._locks: dict[int, asyncio.Lock] = {}
+        self._meta_lock = asyncio.Lock()  # _locks辞書自体への同時アクセスを防ぐ
+
+    async def acquire(self, message_id: int) -> asyncio.Lock:
+        """指定メッセージIDのロックを取得して返す"""
+        async with self._meta_lock:
+            if message_id not in self._locks:
+                self._locks[message_id] = asyncio.Lock()
+        lock = self._locks[message_id]
+        await lock.acquire()
+        return lock
+
+    def release(self, message_id: int):
+        """指定メッセージIDのロックを解放する"""
+        if message_id in self._locks:
+            self._locks[message_id].release()
+
+    def get_context(self, message_id: int):
+        """with文で使えるコンテキストマネージャーを返す"""
+        return _LockContext(self, message_id)
+
+
+class _LockContext:
+    """MessageLockManagerをasync withで使うためのコンテキストマネージャー"""
+
+    def __init__(self, manager: MessageLockManager, message_id: int):
+        self._manager = manager
+        self._message_id = message_id
+
+    async def __aenter__(self):
+        await self._manager.acquire(self._message_id)
+
+    async def __aexit__(self, *args):
+        self._manager.release(self._message_id)
+
+
+# モジュールレベルのシングルトン
+_lock_manager = MessageLockManager()
 
 
 # ==========================================
@@ -64,19 +111,56 @@ def create_embed(role_name: str, channels_mentions: str, sheet_url: str, partici
         term = data["term"]
         # IDを隠し味として付与（再起動後にパースするため）
         grouped.setdefault(term, []).append(f"{data['name']}(<@{uid}>)")
-    
-    list_str = ""
-    for term in sorted(grouped.keys()):
-        list_str += f"**{term}期**: {' / '.join(grouped[term])}\n"
-    
+
+    lines = []
+    for term in sorted(grouped.keys(), key=lambda x: int(x) if x.isdigit() else 0):
+        lines.append(f"**{term}期**: {' / '.join(grouped[term])}")
+
     embed = discord.Embed(title=f"🎉 「{role_name}」の募集", color=discord.Color.blue())
     desc = f"専用チャンネル: {channels_mentions}\n"
     if sheet_url:
         desc += f"📄 **[参加者一覧]({sheet_url})**\n\n"
     desc += "下のボタンで参加してください。"
     embed.description = desc
-    
-    embed.add_field(name=f"👥 参加者 ({len(participants)}名)", value=list_str or "なし", inline=False)
+
+    # ★ Discordのフィールドvalueは1024文字までという制限があるため、
+    #   超える場合は複数フィールドに分割して追加する。
+    #   parse_participants側は embed.fields を全件ループしているので
+    #   フィールド名が "👥 参加者" で始まっていれば自動的に拾われる。
+    FIELD_VALUE_LIMIT = 1024
+    chunks = []
+    current_chunk = ""
+    for line in lines:
+        candidate = f"{current_chunk}{line}\n"
+        if len(candidate) > FIELD_VALUE_LIMIT:
+            if current_chunk:
+                chunks.append(current_chunk)
+            # 1行だけでも1024文字を超える極端なケースへの保険
+            if len(line) + 1 > FIELD_VALUE_LIMIT:
+                line_with_nl = line + "\n"
+                for i in range(0, len(line_with_nl), FIELD_VALUE_LIMIT):
+                    chunks.append(line_with_nl[i:i + FIELD_VALUE_LIMIT])
+                current_chunk = ""
+            else:
+                current_chunk = f"{line}\n"
+        else:
+            current_chunk = candidate
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    if not chunks:
+        chunks = ["なし"]
+
+    # Embed全体のフィールド数上限（25個）にも収まるよう安全マージンを確保
+    MAX_FIELDS = 24
+    if len(chunks) > MAX_FIELDS:
+        chunks = chunks[:MAX_FIELDS]
+        chunks[-1] += "\n...(表示しきれない参加者がいます。スプレッドシートをご確認ください)"
+
+    for i, chunk in enumerate(chunks):
+        field_name = f"👥 参加者 ({len(participants)}名)" if i == 0 else "👥 参加者（続き）"
+        embed.add_field(name=field_name, value=chunk, inline=False)
+
     return embed
 
 
@@ -131,8 +215,10 @@ class ChannelNamingModal(discord.ui.Modal):
             
             await interaction.channel.send(embed=embed, view=view)
             
+        except discord.Forbidden:
+            await interaction.followup.send("❌ 権限が足りないため、チャンネルまたはロールを作成できませんでした。", ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"❌ エラーが発生しました: {e}", ephemeral=True)
+            await interaction.followup.send(f"❌ 予期しないエラーが発生しました: {e}", ephemeral=True)
 
 class JoinModal(discord.ui.Modal, title='参加者情報の入力'):
     term_input = discord.ui.TextInput(label='期 (2桁)', placeholder='例：24', min_length=1, max_length=2)
@@ -149,8 +235,11 @@ class JoinModal(discord.ui.Modal, title='参加者情報の入力'):
         self.message_id = message_id  # ★ ロック解放に使う
 
     async def on_submit(self, interaction: discord.Interaction):
-        # モーダル送信時点でロックを取得して最新状態を再確認する
-        # （ボタン押下〜モーダル入力の間に他者が登録した可能性があるため）
+        # バリデーションはロック取得前に行う（ロックを無駄に保持しないため）
+        if not self.term_input.value.isdigit():
+            await interaction.response.send_message("❌ 期は数字で入力してください。", ephemeral=True)
+            return
+
         try:
             async with _lock_manager.get_context(self.message_id):
                 # ★ ロック内でメッセージを再フェッチして最新の参加者リストを取得
@@ -159,10 +248,6 @@ class JoinModal(discord.ui.Modal, title='参加者情報の入力'):
 
                 if interaction.user.id in fresh_participants:
                     await interaction.response.send_message("❌ 既に登録されています！（送信中に別の操作が完了しました）", ephemeral=True)
-                    return
-
-                if not self.term_input.value.isdigit():
-                    await interaction.response.send_message("❌ 期は数字で入力してください。", ephemeral=True)
                     return
 
                 term = self.term_input.value.zfill(2)
@@ -211,15 +296,33 @@ class DeleteConfirmModal(discord.ui.Modal, title='⚠️ 削除の最終確認')
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.send_message("募集データ（チャンネル・ロール・スプレッドシート）を削除しています...", ephemeral=True)
-    
+
         for ch in self.channels:
-            await ch.delete()
+            try:
+                await ch.delete()
+            except discord.Forbidden:
+                await interaction.followup.send(f"⚠️ チャンネル {ch.name} の削除に失敗しました（権限不足）。", ephemeral=True)
+            except discord.HTTPException as e:
+                await interaction.followup.send(f"⚠️ チャンネル {ch.name} の削除中にエラーが発生しました: {e}", ephemeral=True)
+
         if self.role:
-            await self.role.delete()
+            try:
+                await self.role.delete()
+            except discord.Forbidden:
+                await interaction.followup.send(f"⚠️ ロール {self.role.name} の削除に失敗しました（権限不足）。", ephemeral=True)
+            except discord.HTTPException as e:
+                await interaction.followup.send(f"⚠️ ロール {self.role.name} の削除中にエラーが発生しました: {e}", ephemeral=True)
+
         if self.original_message:
-            await self.original_message.delete()
-    
-        delete_spreadsheet(self.role_name)
+            try:
+                await self.original_message.delete()
+            except discord.HTTPException as e:
+                await interaction.followup.send(f"⚠️ 募集メッセージの削除中にエラーが発生しました: {e}", ephemeral=True)
+
+        try:
+            delete_spreadsheet(self.role_name)
+        except Exception as e:
+            await interaction.followup.send(f"⚠️ スプレッドシートの削除中にエラーが発生しました: {e}", ephemeral=True)
 
 
 # ==========================================
