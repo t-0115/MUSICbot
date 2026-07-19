@@ -29,7 +29,7 @@ def extract_section(pattern: str, text: str, default: str = '') -> str:
 
 def parse_entry_message(text: str, master_names: dict, last_name_map: dict) -> dict:
     title = extract_section(r'【曲名】([^\n]*)', text, '不明')
-    time_str = extract_section(r'【曲時間】([^\n]*)', text, '')
+    time_str = extract_section(r'【(?:曲|演奏)時間】([^\n]*)', text, '')
     players_raw = extract_section(r'【演奏者】(.*?)(?=\n【|$)', text, '')
     
     players_list = []
@@ -142,6 +142,7 @@ class EntrySheetCog(commands.Cog):
 
     @app_commands.command(name='曲数カウント', description='参加者の演奏曲数をカウントします（未指定で全体の曲数を出力）')
     @app_commands.describe(user="特定の人のみカウントしたい場合はメンション（未指定で全体の曲数を表示）")
+    @app_commands.guild_only()
     async def count_songs(self, interaction: discord.Interaction, user: discord.Member = None):
         await interaction.response.defer(ephemeral=True)
 

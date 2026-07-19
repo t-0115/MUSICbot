@@ -11,6 +11,7 @@ class AnonymousCog(commands.Cog):
     @app_commands.describe(message="投稿するメッセージを入力してください")
     # 🔥 1分間（60秒）の間に「5回」まで投稿可能にする設定（6回目でエラーが発動）
     @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.user.id)
+    @app_commands.guild_only()
     async def anonymous_question(self, interaction: discord.Interaction, message: str):
         await interaction.response.defer(ephemeral=True)
         try:

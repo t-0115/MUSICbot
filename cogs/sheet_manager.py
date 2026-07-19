@@ -78,7 +78,7 @@ def append_to_sheet(role_name: str, term: str, last_name: str, first_name: str, 
         sheet = gc.open(role_name).sheet1
         
         # ★ 「Discord ID」という見出しが何列目にあるか自動で探す
-        id_col = get_column_index(sheet, "Discord ID", fallback_index=7)
+        id_col = get_column_index(sheet, "Discord ID", fallback_index=6)
         
         # 見つからなかった場合はエラーにならず None が返ってきます
         existing_cell = sheet.find(str(discord_id), in_column=id_col)
