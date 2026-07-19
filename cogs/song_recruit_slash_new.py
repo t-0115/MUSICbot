@@ -393,6 +393,7 @@ class SongRecruitSlashCog(commands.Cog):
         self.bot.add_view(PersistentRecruitView())
 
     @app_commands.command(name='曲募集', description='曲の募集を開始します（このチャンネルに投稿されます）')
+    @app_commands.guild_only()
     async def recruit_slash(self, interaction: discord.Interaction):
         await interaction.response.send_modal(RawTextRecruitModal())
 

@@ -274,6 +274,7 @@ class RoleManagerCog(commands.Cog):
         role4='削除するロール4 (任意)',
         role5='削除するロール5 (任意)'
     )
+    @app_commands.guild_only()
     async def delete_roles(
         self, 
         interaction: discord.Interaction, 

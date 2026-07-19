@@ -4,7 +4,13 @@ import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
+from . import sheet_manager
 from .sheet_manager import append_to_sheet, delete_spreadsheet, create_sheet_via_gas, remove_from_sheet
+
+# ★ シート作成直後、Google Drive側の検索インデックスへの反映に
+#   数秒のタイムラグが生じることがある（gc.open(role_name) が見つけられない）。
+#   entry_sheet.py 側は既にこの対策で待機しているので、こちらも合わせる。
+SHEET_INDEX_WAIT_SECONDS = 4
 
 # ==========================================
 # 排他制御用ロックマネージャー
@@ -164,6 +170,91 @@ def create_embed(role_name: str, channels_mentions: str, sheet_url: str, partici
     return embed
 
 
+def _split_name(combined_name: str) -> tuple[str, str]:
+    """Embedに保存されている「姓 名」形式の文字列を、シート書き込み用に分割する。
+    スペースが見つからない場合は名前欄を空にする。"""
+    parts = combined_name.split(" ", 1)
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return parts[0], ""
+
+
+def sync_sheet_with_discord(role_name: str, participants: dict) -> dict:
+    """スプレッドシートの内容をDiscordの参加者一覧に合わせて自己修復する（ベストエフォート処理）。
+    Discord側を正として、シートに無い人を追加し、シートにだけ残っている行を削除する。
+
+    「参加」「参加取り消し」ボタンが押されるたびに呼ばれる想定。専用の同期コマンドを
+    別途用意するのではなく、普段の操作のついでに少しずつ過去の書き込み漏れ・削除漏れを
+    解消していく方針。
+
+    戻り値:
+        {
+            "added": [name, ...],                        追加できた人の名前
+            "add_failed": {discord_id_str: error_msg},    追加に失敗した人
+            "removed": [discord_id_str, ...],              削除できたDiscord ID
+            "remove_failed": {discord_id_str: error_msg},  削除に失敗した人
+        }
+    シート自体が開けない・読み込めない場合は、今回の参加/取消操作自体を巻き込んで
+    失敗させないよう、処理をスキップして空の結果を返す。
+    """
+    result = {"added": [], "add_failed": {}, "removed": [], "remove_failed": {}}
+
+    try:
+        gc = sheet_manager.get_gspread_client()
+        sheet = gc.open(role_name).sheet1
+        id_col = sheet_manager.get_column_index(sheet, "Discord ID", fallback_index=6)
+        all_values = sheet.get_all_values()
+    except Exception as e:
+        print(f"[自動同期] シートの読み込みに失敗したためスキップします: {e}")
+        return result
+
+    sheet_ids = set()
+    if len(all_values) > 1:
+        for row in all_values[1:]:
+            if len(row) >= id_col:
+                cell_value = row[id_col - 1].strip()
+                if cell_value:
+                    sheet_ids.add(cell_value)
+
+    discord_ids = {str(uid) for uid in participants.keys()}
+    only_in_discord = discord_ids - sheet_ids
+    only_in_sheet = sheet_ids - discord_ids
+
+    # ① Discordにはいるがシートに無い人 → シートに追加
+    for uid_str in only_in_discord:
+        uid = int(uid_str)
+        info = participants.get(uid)
+        if not info:
+            continue
+        last_name, first_name = _split_name(info["name"])
+        try:
+            append_to_sheet(
+                role_name=role_name,
+                term=info["term"],
+                last_name=last_name,
+                first_name=first_name,
+                discord_id=uid
+            )
+            result["added"].append(info["name"])
+        except Exception as e:
+            result["add_failed"][uid_str] = str(e)
+            print(f"[自動同期] 追加失敗 ({info['name']}): {e}")
+
+    # ② シートにはあるがDiscordにいない人 → シートから削除
+    for uid_str in only_in_sheet:
+        try:
+            remove_from_sheet(role_name, int(uid_str))
+            result["removed"].append(uid_str)
+        except Exception as e:
+            result["remove_failed"][uid_str] = str(e)
+            print(f"[自動同期] 削除失敗 (Discord ID: {uid_str}): {e}")
+
+    if result["added"] or result["removed"]:
+        print(f"[自動同期] role={role_name} added={result['added']} removed={result['removed']}")
+
+    return result
+
+
 # ==========================================
 # Modals (入力フォーム関連)
 # ==========================================
@@ -210,6 +301,12 @@ class ChannelNamingModal(discord.ui.Modal):
                 created_channels.append(ch)
 
             channels_mentions = " ".join([ch.mention for ch in created_channels]) if created_channels else "なし"
+
+            # ★ シート作成直後はDrive側の検索インデックス反映が間に合わないことがあるため、
+            #   参加ボタン付きのメッセージを投稿する前に少し待つ。
+            #   （役職・チャンネル作成の間にある程度時間は経過しているが、念のため保証する）
+            await asyncio.sleep(SHEET_INDEX_WAIT_SECONDS)
+
             embed = create_embed(self.role_name, channels_mentions, sheet_url, {})
             view = StartView()
             
@@ -266,17 +363,19 @@ class JoinModal(discord.ui.Modal, title='参加者情報の入力'):
             # ロック解放後にユーザーへ応答（editが完了してから通知）
             await interaction.response.send_message(f"【{term}期】{user_name_combined}として参加登録しました！", ephemeral=True)
 
-            try:
-                append_to_sheet(
-                    role_name=self.role_name,
-                    term=term,
-                    last_name=last_name,
-                    first_name=first_name,
-                    discord_id=discord_id
+            # ★ 自分の登録だけでなく、ついでにシート全体をDiscordの状態に自己修復する。
+            #   （過去の書き込み漏れ・削除漏れがあれば、この操作を機に解消される）
+            sync_result = sync_sheet_with_discord(self.role_name, fresh_participants)
+
+            if str(discord_id) in sync_result["add_failed"]:
+                error_msg = sync_result["add_failed"][str(discord_id)]
+                print(f"Spreadsheet Error: {error_msg}")
+                await interaction.followup.send(
+                    "⚠️ （システム通知）スプレッドシートへの記録に失敗しました。"
+                    "Discord上は参加登録済みですが、シートには反映されていない可能性があります。"
+                    "別の人が参加/参加取り消しボタンを押すと自動的に再試行されます。",
+                    ephemeral=True
                 )
-            except Exception as e:
-                print(f"Spreadsheet Error: {e}")
-                await interaction.followup.send("⚠️ （システム通知）スプレッドシートへの記録に失敗しました。", ephemeral=True)
 
         except discord.NotFound:
             await interaction.response.send_message("❌ 募集メッセージが見つかりません。削除された可能性があります。", ephemeral=True)
@@ -380,10 +479,22 @@ class StartView(discord.ui.View):
 
         await interaction.response.send_message("参加を取り消しました。", ephemeral=True)
 
-        try:
-            remove_from_sheet(role_name, interaction.user.id)
-        except Exception as e:
-            print(f"行削除時のエラー: {e}")
+        # ★ 自分の取消だけでなく、ついでにシート全体をDiscordの状態に自己修復する。
+        sync_result = sync_sheet_with_discord(role_name, participants)
+
+        if str(interaction.user.id) in sync_result["remove_failed"]:
+            error_msg = sync_result["remove_failed"][str(interaction.user.id)]
+            print(f"行削除時のエラー: {error_msg}")
+            # ★ Discord側は取消済みなのに、シート側の削除に失敗したことをサイレントにしない。
+            try:
+                await interaction.followup.send(
+                    "⚠️ （システム通知）スプレッドシートからの削除に失敗しました。"
+                    "Discord上は取消済みですが、シート上にはまだ行が残っている可能性があります。"
+                    "別の人が参加/参加取り消しボタンを押すと自動的に再試行されます。",
+                    ephemeral=True
+                )
+            except discord.HTTPException:
+                pass
 
     @discord.ui.button(label="削除", style=discord.ButtonStyle.danger, custom_id="start_delete")
     async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -395,6 +506,73 @@ class StartView(discord.ui.View):
         channels = [interaction.guild.get_channel(cid) for cid in channel_ids if interaction.guild.get_channel(cid)]
         
         await interaction.response.send_modal(DeleteConfirmModal(role, role_name, channels, interaction.message))
+
+
+# ==========================================
+# 参加者チェック（Discord ⇔ スプレッドシート 突き合わせ・確認専用）
+# ==========================================
+@app_commands.context_menu(name="参加者チェック")
+async def check_consistency(interaction: discord.Interaction, message: discord.Message):
+    """募集メッセージを右クリック（長押し）して実行。
+    Embed上の参加者一覧とスプレッドシートの内容を突き合わせ、不一致を報告する（確認のみ）。
+    実際の同期（追加・削除）はこのコマンドでは行わない。
+    誰かが「参加」または「参加取り消し」ボタンを押すたびに sync_sheet_with_discord() が
+    自動で走り、その時点の不一致を少しずつ解消していく仕組みになっている。"""
+    await interaction.response.defer(ephemeral=True)
+
+    role_name, _, _, participants = extract_info_from_message(message)
+    if not role_name or role_name == "不明":
+        await interaction.followup.send("❌ このメッセージは募集メッセージとして認識できませんでした。", ephemeral=True)
+        return
+
+    try:
+        gc = sheet_manager.get_gspread_client()
+        sheet = gc.open(role_name).sheet1
+    except Exception as e:
+        await interaction.followup.send(f"❌ スプレッドシート「{role_name}」を開けませんでした: {e}", ephemeral=True)
+        return
+
+    id_col = sheet_manager.get_column_index(sheet, "Discord ID", fallback_index=6)
+    all_values = sheet.get_all_values()
+
+    sheet_ids = set()
+    if len(all_values) > 1:
+        for row in all_values[1:]:
+            if len(row) >= id_col:
+                cell_value = row[id_col - 1].strip()
+                if cell_value:
+                    sheet_ids.add(cell_value)
+
+    discord_ids = {str(uid) for uid in participants.keys()}
+
+    only_in_discord = discord_ids - sheet_ids
+    only_in_sheet = sheet_ids - discord_ids
+
+    if not only_in_discord and not only_in_sheet:
+        await interaction.followup.send("✅ Discordの参加者一覧とスプレッドシートは一致しています！", ephemeral=True)
+        return
+
+    lines = ["⚠️ 不一致が見つかりました。\n"]
+
+    if only_in_discord:
+        lines.append("**【Discordにはいるが、シートに無い】** → シートへの書き込み漏れの可能性")
+        for uid in sorted(only_in_discord):
+            info = participants.get(int(uid), {})
+            lines.append(f"・{info.get('name', '?')} (<@{uid}>)")
+        lines.append("")
+
+    if only_in_sheet:
+        lines.append("**【シートにはあるが、Discordにいない】** → 取消時の削除漏れの可能性")
+        for uid in sorted(only_in_sheet):
+            lines.append(f"・Discord ID: {uid}")
+
+    lines.append("\nℹ️ 誰かが「参加」または「参加取り消し」ボタンを押すと、その操作のついでに自動で同期されます。")
+
+    summary = "\n".join(lines)
+    if len(summary) > 1900:
+        summary = summary[:1900] + "\n...(文字数制限のため省略されました)"
+
+    await interaction.followup.send(summary, ephemeral=True)
 
 
 # ==========================================
@@ -420,6 +598,10 @@ class StartCog(commands.Cog):
             try:
                 new_role = await interaction.guild.create_role(name=role_name)
                 sheet_url = create_sheet_via_gas(role_name)
+
+                # ★ シート作成直後はDrive側の検索インデックス反映が間に合わないことがあるため、
+                #   参加ボタン付きのメッセージを投稿する前に少し待つ。
+                await asyncio.sleep(SHEET_INDEX_WAIT_SECONDS)
                 
                 embed = create_embed(role_name, "なし", sheet_url, {})
                 view = StartView()
@@ -435,3 +617,4 @@ class StartCog(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(StartCog(bot))
+    bot.tree.add_command(check_consistency)
