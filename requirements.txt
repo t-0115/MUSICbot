@@ -3,3 +3,4 @@ Flask
 python-dotenv
 gspread
 google-auth
+mido
