@@ -1,6 +1,7 @@
 # cogs/start.py
 import re
 import asyncio
+import gspread
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -170,6 +171,45 @@ def create_embed(role_name: str, channels_mentions: str, sheet_url: str, partici
     return embed
 
 
+def parse_roster_sheet(sheet) -> tuple[dict, int]:
+    """参加者名簿シート（sheet_manager.DEFAULT_HEADERS形式）の全行を読み、
+    「募集名」ごとに participants 辞書へグループ化する。
+    通常は1シート=1募集名だが、手動編集等で複数の募集名が混在していても
+    それぞれ別の募集として扱えるようにグループ化している。
+
+    戻り値: ({role_name: {discord_id: {"name": "姓 名", "term": term}}}, スキップした行数)
+    """
+    all_values = sheet.get_all_values()
+    if len(all_values) < 2:
+        return {}, 0
+
+    role_idx = sheet_manager.get_column_index(sheet, "募集名", fallback_index=2) - 1
+    term_idx = sheet_manager.get_column_index(sheet, "期", fallback_index=3) - 1
+    last_idx = sheet_manager.get_column_index(sheet, "名字", fallback_index=4) - 1
+    first_idx = sheet_manager.get_column_index(sheet, "名前", fallback_index=5) - 1
+    id_idx = sheet_manager.get_column_index(sheet, "Discord ID", fallback_index=6) - 1
+    max_idx = max(role_idx, term_idx, last_idx, first_idx, id_idx)
+
+    grouped: dict = {}
+    skipped = 0
+    for row in all_values[1:]:
+        if len(row) <= max_idx:
+            skipped += 1
+            continue
+
+        role_name = row[role_idx].strip()
+        discord_id_str = row[id_idx].strip()
+        if not role_name or not discord_id_str.isdigit():
+            skipped += 1
+            continue
+
+        term = row[term_idx].strip()
+        name = f"{row[last_idx].strip()} {row[first_idx].strip()}".strip()
+        grouped.setdefault(role_name, {})[int(discord_id_str)] = {"name": name, "term": term}
+
+    return grouped, skipped
+
+
 def _split_name(combined_name: str) -> tuple[str, str]:
     """Embedに保存されている「姓 名」形式の文字列を、シート書き込み用に分割する。
     スペースが見つからない場合は名前欄を空にする。"""
@@ -301,6 +341,12 @@ class ChannelNamingModal(discord.ui.Modal):
                 created_channels.append(ch)
 
             channels_mentions = " ".join([ch.mention for ch in created_channels]) if created_channels else "なし"
+
+            # ★ チャンネル削除後にも復元できるよう、作成したチャンネルをシートに記録しておく（ベストエフォート）。
+            try:
+                sheet_manager.record_channels(self.role_name, created_channels)
+            except Exception as e:
+                print(f"[チャンネル記録] スプレッドシートへの記録に失敗しました: {e}")
 
             # ★ シート作成直後はDrive側の検索インデックス反映が間に合わないことがあるため、
             #   参加ボタン付きのメッセージを投稿する前に少し待つ。
@@ -614,6 +660,148 @@ class StartCog(commands.Cog):
         else:
             modal = ChannelNamingModal(role_name=role_name, count=channel_count)
             await interaction.response.send_modal(modal)
+
+    @app_commands.command(name="start復元", description="スプレッドシートの参加者名簿から募集メッセージ・チャンネル・ロールを復元します")
+    @app_commands.describe(sheet_url="復元元の参加者名簿スプレッドシートのURL")
+    async def restore_recruit(self, interaction: discord.Interaction, sheet_url: str):
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            gc = sheet_manager.get_gspread_client()
+            spreadsheet = gc.open_by_url(sheet_url)
+            sheet = spreadsheet.sheet1
+        except gspread.exceptions.SpreadsheetNotFound:
+            await interaction.followup.send("❌ 指定されたスプレッドシートが見つかりませんでした。URLを確認してください。", ephemeral=True)
+            return
+        except Exception as e:
+            await interaction.followup.send(f"❌ スプレッドシートを開けませんでした: {e}", ephemeral=True)
+            return
+
+        grouped, skipped = parse_roster_sheet(sheet)
+        if not grouped:
+            await interaction.followup.send("❌ 復元できる参加者データが見つかりませんでした。", ephemeral=True)
+            return
+
+        try:
+            channel_records = sheet_manager.get_recorded_channels(spreadsheet)
+        except Exception as e:
+            print(f"[復元] チャンネル情報の読み込みに失敗しました: {e}")
+            channel_records = {}
+
+        posted = []
+        created_roles = []
+        created_channels_report = []
+        channel_failed = []
+        channel_perm_failed = []
+        role_missing_channels = []
+        role_assigned_count = 0
+        role_assign_failed = []
+        member_not_found = 0
+
+        for role_name, participants in grouped.items():
+            role = discord.utils.get(interaction.guild.roles, name=role_name)
+            if not role:
+                try:
+                    role = await interaction.guild.create_role(name=role_name)
+                    created_roles.append(role_name)
+                except discord.Forbidden:
+                    role = None
+
+            recreated_channels = []
+            if role:
+                overwrites = {
+                    interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                    role: discord.PermissionOverwrite(view_channel=True),
+                    interaction.guild.me: discord.PermissionOverwrite(view_channel=True)
+                }
+
+                for record in channel_records.get(role_name, []):
+                    ch = interaction.guild.get_channel(record["id"]) if record["id"] else None
+                    if not ch:
+                        ch = discord.utils.get(interaction.guild.text_channels, name=record["name"])
+
+                    if not ch:
+                        try:
+                            ch = await interaction.guild.create_text_channel(
+                                name=record["name"],
+                                category=getattr(interaction.channel, 'category', None),
+                                overwrites=overwrites
+                            )
+                            created_channels_report.append(record["name"])
+                        except discord.Forbidden:
+                            channel_failed.append(record["name"])
+                            continue
+                    else:
+                        # ★ 既存チャンネルでも、非公開設定（対象ロールのみ閲覧可）を復元のたびに再適用し、
+                        #   手動変更等によるドリフトを是正する（他の overwrite は巻き込まないよう個別に設定）。
+                        try:
+                            await ch.set_permissions(interaction.guild.default_role, view_channel=False)
+                            await ch.set_permissions(role, view_channel=True)
+                            await ch.set_permissions(interaction.guild.me, view_channel=True)
+                        except discord.Forbidden:
+                            channel_perm_failed.append(record["name"])
+
+                    # ★ 再作成やID不一致でDiscord側のIDが変わった場合、シート側も最新IDに更新しておく
+                    if record["id"] != ch.id:
+                        sheet_manager.update_channel_id(spreadsheet, record["name"], ch.id)
+
+                    recreated_channels.append(ch)
+            elif channel_records.get(role_name):
+                # ★ ロールが無い状態でチャンネルを作ると非公開設定にできないため、
+                #   /start本来の挙動（ロールが無ければチャンネルも作らない）に合わせてスキップする。
+                role_missing_channels.append(role_name)
+
+            channels_mentions = " ".join(ch.mention for ch in recreated_channels) if recreated_channels else "なし"
+
+            # ★ 参加者全員にロールを付け直す（復元直後はDiscordロールが未付与のため）
+            if role:
+                for uid, info in participants.items():
+                    member = interaction.guild.get_member(uid)
+                    if not member:
+                        try:
+                            member = await interaction.guild.fetch_member(uid)
+                        except discord.NotFound:
+                            member_not_found += 1
+                            continue
+                        except discord.HTTPException:
+                            member_not_found += 1
+                            continue
+
+                    if role in member.roles:
+                        continue
+
+                    try:
+                        await member.add_roles(role)
+                        role_assigned_count += 1
+                    except discord.Forbidden:
+                        role_assign_failed.append(info["name"])
+
+            embed = create_embed(role_name, channels_mentions, spreadsheet.url, participants)
+            # ★ Embed内の参加者メンションは元々通知対象外だが、念のため一切メンション通知が飛ばないようにする
+            await interaction.channel.send(embed=embed, view=StartView(), allowed_mentions=discord.AllowedMentions.none())
+            posted.append(f"「{role_name}」({len(participants)}名)")
+
+        lines = [f"✅ {len(posted)}件の募集メッセージを復元しました: " + "、".join(posted)]
+        if created_roles:
+            lines.append("🔧 ロールを再作成しました: " + "、".join(created_roles))
+        if created_channels_report:
+            lines.append("🔧 チャンネルを再作成しました: " + "、".join(created_channels_report))
+        if channel_failed:
+            lines.append("⚠️ 権限不足のため再作成できなかったチャンネルがあります: " + "、".join(channel_failed))
+        if channel_perm_failed:
+            lines.append("⚠️ 権限不足のため非公開設定を再適用できなかったチャンネルがあります: " + "、".join(channel_perm_failed))
+        if role_missing_channels:
+            lines.append("⚠️ ロールを作成できなかったため、以下の募集ではチャンネルの復元をスキップしました: " + "、".join(role_missing_channels))
+        if role_assigned_count:
+            lines.append(f"🎭 {role_assigned_count}人にロールを再付与しました。")
+        if member_not_found:
+            lines.append(f"⚠️ {member_not_found}人はサーバーに見つからなかったためロール付与をスキップしました（退出済みの可能性）。")
+        if role_assign_failed:
+            lines.append("⚠️ 権限不足のためロールを付与できなかった人がいます: " + "、".join(role_assign_failed))
+        if skipped:
+            lines.append(f"⚠️ {skipped}行はDiscord IDが不正/欠落のためスキップしました。")
+
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 async def setup(bot):
     await bot.add_cog(StartCog(bot))

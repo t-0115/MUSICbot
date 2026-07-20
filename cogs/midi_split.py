@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands
 import mido
 import os
+import statistics
 import tempfile
 
 # === 音楽処理用パラメーター ===
@@ -21,6 +22,18 @@ PEDAL_DURATION_BEATS = 4
 # === お掃除（MuseScore最適化）用パラメーター ===
 QUANTIZE_TOLERANCE = 30
 CUT_OVERLAP = True
+
+# === 自動パラメータ推定用パラメーター ===
+PIANO_NOTE_MIN = 21
+PIANO_NOTE_MAX = 108
+EXTREME_RANGE_MIN_NOTES = 8
+
+QUANTIZE_GRID_DIVISORS = [32, 24, 16, 12, 8, 6, 4, 3, 2, 1]
+QUANTIZE_MIN_NOTES = 12
+QUANTIZE_MATCH_RATIO = 0.9
+QUANTIZE_GRID_ERROR_RATIO = 0.15
+QUANTIZE_TOLERANCE_MIN = 5
+QUANTIZE_TOLERANCE_MAX = 60
 
 
 def cut_overlap_and_build(events, ticks_per_beat):
@@ -351,6 +364,50 @@ def repair_idle_imbalance(assigned_r, assigned_l, ticks_per_beat, max_span):
         if not changed:
             break
 
+def estimate_extreme_range(note_objects):
+    pitches = [n['note'] for n in note_objects]
+    if len(pitches) < EXTREME_RANGE_MIN_NOTES:
+        return EXTREME_LOW, EXTREME_HIGH
+
+    q1, _, q3 = statistics.quantiles(pitches, n=4, method='inclusive')
+    iqr = q3 - q1
+    if iqr <= 0:
+        return EXTREME_LOW, EXTREME_HIGH
+
+    low = max(PIANO_NOTE_MIN, min(PIANO_NOTE_MAX, round(q1 - 1.5 * iqr)))
+    high = max(PIANO_NOTE_MIN, min(PIANO_NOTE_MAX, round(q3 + 1.5 * iqr)))
+
+    if low >= high:
+        return EXTREME_LOW, EXTREME_HIGH
+
+    return int(low), int(high)
+
+def estimate_quantize_tolerance(note_objects, ticks_per_beat):
+    starts = [n['start'] for n in note_objects]
+    if len(starts) < QUANTIZE_MIN_NOTES:
+        return QUANTIZE_TOLERANCE
+
+    tol_max = min(QUANTIZE_TOLERANCE_MAX, max(QUANTIZE_TOLERANCE_MIN, ticks_per_beat // 2))
+
+    for d in QUANTIZE_GRID_DIVISORS:
+        grid = ticks_per_beat / d
+        if grid < 1:
+            continue
+
+        err_limit = grid * QUANTIZE_GRID_ERROR_RATIO
+        matched = 0
+        for t in starts:
+            remainder = t % grid
+            dist = min(remainder, grid - remainder)
+            if dist <= err_limit:
+                matched += 1
+
+        if matched / len(starts) >= QUANTIZE_MATCH_RATIO:
+            tol = max(QUANTIZE_TOLERANCE_MIN, min(tol_max, grid / 2))
+            return int(round(tol))
+
+    return QUANTIZE_TOLERANCE
+
 def split_single_track(input_track, ticks_per_beat, ticks_per_bar):
     abs_time = 0
     active_notes = {}
@@ -385,7 +442,11 @@ def split_single_track(input_track, ticks_per_beat, ticks_per_bar):
         })
 
     note_objects.sort(key=lambda x: x['start'])
-    note_objects = quantize_note_starts(note_objects, QUANTIZE_TOLERANCE)
+
+    extreme_low, extreme_high = estimate_extreme_range(note_objects)
+    quantize_tolerance = estimate_quantize_tolerance(note_objects, ticks_per_beat)
+
+    note_objects = quantize_note_starts(note_objects, quantize_tolerance)
 
     bar_averages = {}
     for n in note_objects:
@@ -408,7 +469,7 @@ def split_single_track(input_track, ticks_per_beat, ticks_per_bar):
     assigned_r = []
     assigned_l = []
 
-    clusters = cluster_note_objects(note_objects, QUANTIZE_TOLERANCE)
+    clusters = cluster_note_objects(note_objects, quantize_tolerance)
     MAX_SPAN = 12
 
     for cluster in clusters:
@@ -445,9 +506,9 @@ def split_single_track(input_track, ticks_per_beat, ticks_per_bar):
             if note < ema_left: cost_r += PENALTY_CROSS_HAND
             if note > ema_right: cost_l += PENALTY_CROSS_HAND
 
-            if note < EXTREME_LOW:
+            if note < extreme_low:
                 cost_r += PENALTY_EXTREME_RANGE
-            elif note > EXTREME_HIGH:
+            elif note > extreme_high:
                 cost_l += PENALTY_EXTREME_RANGE
 
             idle_r_beats = (n_start - last_end_r) / ticks_per_beat
@@ -523,7 +584,12 @@ def split_single_track(input_track, ticks_per_beat, ticks_per_bar):
             last_time = ev['time']
         return track
 
-    return build_track(cleaned_r, "Right"), build_track(cleaned_l, "Left")
+    split_params = {
+        'extreme_low': extreme_low,
+        'extreme_high': extreme_high,
+        'quantize_tolerance': quantize_tolerance,
+    }
+    return build_track(cleaned_r, "Right"), build_track(cleaned_l, "Left"), split_params
 
 def copy_track_clean(input_track):
     track = mido.MidiTrack()
@@ -600,9 +666,10 @@ class MidiSplit(commands.Cog):
                 output_midi = mido.MidiFile(type=1)
                 output_midi.ticks_per_beat = input_midi.ticks_per_beat
 
+                split_params = None
                 for i, track in enumerate(input_midi.tracks):
                     if i == target_track_index:
-                        track_r, track_l = split_single_track(track, input_midi.ticks_per_beat, ticks_per_bar)
+                        track_r, track_l, split_params = split_single_track(track, input_midi.ticks_per_beat, ticks_per_bar)
                         output_midi.tracks.append(track_r)
                         output_midi.tracks.append(track_l)
                     else:
@@ -612,7 +679,13 @@ class MidiSplit(commands.Cog):
 
                 # 結果の送信
                 result_file = discord.File(output_filepath, filename=f"split_{attachment.filename}")
-                await ctx.send("処理が完了しました！", file=result_file)
+                param_note = ""
+                if split_params:
+                    param_note = (
+                        f"\n検出パラメータ: 音域境界={split_params['extreme_low']}〜{split_params['extreme_high']}"
+                        f" / クオンタイズ許容値={split_params['quantize_tolerance']}tick"
+                    )
+                await ctx.send(f"処理が完了しました！{param_note}", file=result_file)
 
             except Exception as e:
                 await ctx.send(f"【エラー】処理中に問題が発生しました:\n`{str(e)}`")
