@@ -24,6 +24,7 @@ class MyBot(commands.Bot):
         await self.load_extension("cogs.role_manager")
         await self.load_extension("cogs.help")
         await self.load_extension("cogs.anonymous")
+        await self.load_extension("cogs.midi_split")
 
         # 環境変数 'RENDER' の有無でローカルか本番かを判定
         if not os.getenv('RENDER'):
