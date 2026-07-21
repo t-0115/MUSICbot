@@ -203,6 +203,7 @@ def repair_hand_crossing(assigned_r, assigned_l, ticks_per_beat, max_span):
             [{'n': n, 'hand': 'left'} for n in assigned_l],
             key=lambda x: x['n']['start']
         )
+        id_to_item = {id(item['n']): item for item in timeline}
         changed = False
 
         for item in timeline:
@@ -241,6 +242,9 @@ def repair_hand_crossing(assigned_r, assigned_l, ticks_per_beat, max_span):
                         item['hand'] = other
                         for ev in evicted:
                             move_note(ev, other, hand)
+                            ev_item = id_to_item.get(id(ev))
+                            if ev_item is not None:
+                                ev_item['hand'] = hand
                         changed = True
 
         if changed:
@@ -271,6 +275,7 @@ def repair_octave_span(assigned_r, assigned_l, ticks_per_beat, max_span):
             [{'n': n, 'hand': 'left'} for n in assigned_l],
             key=lambda x: x['n']['start']
         )
+        id_to_item = {id(item['n']): item for item in timeline}
         changed = False
 
         for item in timeline:
@@ -315,6 +320,9 @@ def repair_octave_span(assigned_r, assigned_l, ticks_per_beat, max_span):
                     item['hand'] = other
                     for ev in evicted:
                         move_note(ev, other, hand)
+                        ev_item = id_to_item.get(id(ev))
+                        if ev_item is not None:
+                            ev_item['hand'] = hand
                     changed = True
 
         if changed:
