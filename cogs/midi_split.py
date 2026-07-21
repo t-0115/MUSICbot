@@ -415,17 +415,19 @@ def estimate_quantize_tolerance(grid, ticks_per_beat):
     tol = max(QUANTIZE_TOLERANCE_MIN, min(tol_max, grid / 2))
     return int(round(tol))
 
-def quantize_note_durations(note_objects, grid, ticks_per_beat):
+def quantize_notes_to_grid(note_objects, grid, ticks_per_beat):
     if not grid:
         return note_objects
 
     for n in note_objects:
         duration = n['end'] - n['start']
-        quantized = round(duration / grid) * grid
-        quantized = max(grid, quantized)
-        n['end'] = n['start'] + int(round(quantized))
+        new_start = int(round(n['start'] / grid) * grid)
+        quantized_duration = max(grid, round(duration / grid) * grid)
+        n['start'] = new_start
+        n['end'] = new_start + int(round(quantized_duration))
         n['duration_beats'] = (n['end'] - n['start']) / ticks_per_beat
 
+    note_objects.sort(key=lambda x: x['start'])
     return note_objects
 
 def split_single_track(input_track, ticks_per_beat, ticks_per_bar):
@@ -467,8 +469,10 @@ def split_single_track(input_track, ticks_per_beat, ticks_per_bar):
     quantize_grid = estimate_quantize_grid(note_objects, ticks_per_beat)
     quantize_tolerance = estimate_quantize_tolerance(quantize_grid, ticks_per_beat)
 
-    note_objects = quantize_note_starts(note_objects, quantize_tolerance)
-    note_objects = quantize_note_durations(note_objects, quantize_grid, ticks_per_beat)
+    if quantize_grid:
+        note_objects = quantize_notes_to_grid(note_objects, quantize_grid, ticks_per_beat)
+    else:
+        note_objects = quantize_note_starts(note_objects, quantize_tolerance)
 
     bar_averages = {}
     for n in note_objects:
