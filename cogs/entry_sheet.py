@@ -152,13 +152,13 @@ class EntrySheetCog(commands.Cog):
             return
         spreadsheet = result.spreadsheet
 
-        worksheets = spreadsheet.worksheets()
-        if len(worksheets) < 2:
-            await interaction.followup.send("⚠️ エントリー集計のタブ（2つ目のタブ）が見つかりません。先に `/エントリー集計` を実行してください。")
+        try:
+            entry_sheet = spreadsheet.worksheet(sheet_manager.ENTRY_SHEET_TITLE)
+        except gspread.exceptions.WorksheetNotFound:
+            await interaction.followup.send(f"⚠️ エントリー集計のタブ（「{sheet_manager.ENTRY_SHEET_TITLE}」）が見つかりません。先に `/エントリー集計` を実行してください。")
             return
 
         try:
-            entry_sheet = worksheets[1]
             entry_data = entry_sheet.get_all_values()
 
             if not entry_data or len(entry_data) < 2:
@@ -256,13 +256,11 @@ class EntrySheetCog(commands.Cog):
         except Exception as e:
             print(f"参加者マスターデータの取得に失敗しました: {e}")
 
-        worksheets = spreadsheet.worksheets()
-        if len(worksheets) >= 2:
-            worksheet = worksheets[1]
+        worksheet_name = sheet_manager.ENTRY_SHEET_TITLE
+        try:
+            worksheet = spreadsheet.worksheet(worksheet_name)
             worksheet.clear()
-            worksheet_name = worksheet.title
-        else:
-            worksheet_name = "エントリー"
+        except gspread.exceptions.WorksheetNotFound:
             worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows="100", cols="30")
 
         extracted_data = []
