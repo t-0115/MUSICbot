@@ -102,7 +102,9 @@ def quantize_note_starts(note_objects, tolerance):
     last_time = -1
     for n in note_objects:
         if last_time != -1 and abs(n['start'] - last_time) <= tolerance:
+            shift = n['start'] - last_time
             n['start'] = last_time
+            n['end'] -= shift
         else:
             last_time = n['start']
     return note_objects
@@ -382,12 +384,10 @@ def estimate_extreme_range(note_objects):
 
     return int(low), int(high)
 
-def estimate_quantize_tolerance(note_objects, ticks_per_beat):
+def estimate_quantize_grid(note_objects, ticks_per_beat):
     starts = [n['start'] for n in note_objects]
     if len(starts) < QUANTIZE_MIN_NOTES:
-        return QUANTIZE_TOLERANCE
-
-    tol_max = min(QUANTIZE_TOLERANCE_MAX, max(QUANTIZE_TOLERANCE_MIN, ticks_per_beat // 2))
+        return None
 
     for d in QUANTIZE_GRID_DIVISORS:
         grid = ticks_per_beat / d
@@ -403,10 +403,30 @@ def estimate_quantize_tolerance(note_objects, ticks_per_beat):
                 matched += 1
 
         if matched / len(starts) >= QUANTIZE_MATCH_RATIO:
-            tol = max(QUANTIZE_TOLERANCE_MIN, min(tol_max, grid / 2))
-            return int(round(tol))
+            return grid
 
-    return QUANTIZE_TOLERANCE
+    return None
+
+def estimate_quantize_tolerance(grid, ticks_per_beat):
+    if grid is None:
+        return QUANTIZE_TOLERANCE
+
+    tol_max = min(QUANTIZE_TOLERANCE_MAX, max(QUANTIZE_TOLERANCE_MIN, ticks_per_beat // 2))
+    tol = max(QUANTIZE_TOLERANCE_MIN, min(tol_max, grid / 2))
+    return int(round(tol))
+
+def quantize_note_durations(note_objects, grid, ticks_per_beat):
+    if not grid:
+        return note_objects
+
+    for n in note_objects:
+        duration = n['end'] - n['start']
+        quantized = round(duration / grid) * grid
+        quantized = max(grid, quantized)
+        n['end'] = n['start'] + int(round(quantized))
+        n['duration_beats'] = (n['end'] - n['start']) / ticks_per_beat
+
+    return note_objects
 
 def split_single_track(input_track, ticks_per_beat, ticks_per_bar):
     abs_time = 0
@@ -444,9 +464,11 @@ def split_single_track(input_track, ticks_per_beat, ticks_per_bar):
     note_objects.sort(key=lambda x: x['start'])
 
     extreme_low, extreme_high = estimate_extreme_range(note_objects)
-    quantize_tolerance = estimate_quantize_tolerance(note_objects, ticks_per_beat)
+    quantize_grid = estimate_quantize_grid(note_objects, ticks_per_beat)
+    quantize_tolerance = estimate_quantize_tolerance(quantize_grid, ticks_per_beat)
 
     note_objects = quantize_note_starts(note_objects, quantize_tolerance)
+    note_objects = quantize_note_durations(note_objects, quantize_grid, ticks_per_beat)
 
     bar_averages = {}
     for n in note_objects:
